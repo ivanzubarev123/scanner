@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>3D локализация светодиодных шариков</title>
+    <style>
+        body { font-family: Arial; margin: 20px; }
+        video, canvas { border: 1px solid #ccc; }
+        #output { margin-top: 10px; white-space: pre-wrap; }
+    </style>
+</head>
+<body>
+    <h2>Локализация светящихся шариков</h2>
+    <video id="video" width="640" height="480" autoplay playsinline></video>
+    <canvas id="canvas" width="640" height="480"></canvas>
+    <div id="output"></div>
+    <button id="startBtn">Начать сканирование</button>
+    <button id="stopBtn">Остановить</button>
+
+    <script>
+        // ---------- ПАРАМЕТРЫ КАЛИБРОВКИ (настраиваются пользователем) ----------
+        const REAL_BALL_DIAMETER = 10;   // реальный диаметр шарика в мм
+        // Фокусное расстояние в пикселях. Можно получить калибровкой:
+        // f_pix = (ширина_объекта_в_пикселях * расстояние_до_объекта_мм) / реальная_ширина_объекта_мм
+        const FOCAL_LENGTH_PIX = 800;    // примерное значение, замените своим
+        // Оптический центр камеры (обычно центр изображения)
+        const CX = 320;                  // половина ширины кадра
+        const CY = 240;                  // половина высоты кадра
+        // Порог яркости для детектирования вспышки (0-255)
+        const BRIGHTNESS_THRESHOLD = 200;
+        // Минимальная площадь пятна (в пикселях), чтобы игнорировать шумы
+        const MIN_BLOB_AREA = 20;
+        // ----------------------------------------------------------------------
+
+        const video = document.getElementById('video');
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d', { willReadFrequently: true });
+        const outputDiv = document.getElementById('output');
+
+        let scanning = false;
+        let prevBlobDetected = false;
+        let points3D = [];          // массив найденных точек {x, y, z}
+        let lastFrameTime = 0;
+        let frameInterval = 30;     // ~33 fps
+
+        // Запуск видеопотока
+        async function initCamera() {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    video: { width: 640, height: 480, facingMode: 'environment' },
+                    audio: false
+                });
+                video.srcObject = stream;
+                await video.play();
+                console.log('Камера запущена');
+            } catch (err) {
+                console.error('Ошибка доступа к камере:', err);
+            }
+        }
+
+        // Захват кадра и обработка
+        function processFrame() {
+            if (!scanning) {
+                requestAnimationFrame(processFrame);
+                return;
+            }
+
+            const now = performance.now();
+            if (now - lastFrameTime < frameInterval) {
+                requestAnimationFrame(processFrame);
+                return;
+            }
+            lastFrameTime = now;
+
+            // Рисуем текущий кадр видео на canvas
+            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+            const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+            const data = imageData.data;
+
+            // Поиск ярких пикселей
+            let minX = canvas.width, maxX = -1, minY = canvas.height, maxY = -1;
+            let sumX = 0, sumY = 0, sumW = 0;
+            let blobPixels = [];
+
+            for (let y = 0; y < canvas.height; y++) {
+                for (let x = 0; x < canvas.width; x++) {
+                    const idx = (y * canvas.width + x) * 4;
+                    const r = data[idx];
+                    const g = data[idx + 1];
+                    const b = data[idx + 2];
+                    const gray = 0.299 * r + 0.587 * g + 0.114 * b; // яркость
+                    if (gray > BRIGHTNESS_THRESHOLD) {
+                        // Если пиксель яркий, считаем его частью вспышки
+                        if (x < minX) minX = x;
+                        if (x > maxX) maxX = x;
+                        if (y < minY) minY = y;
+                        if (y > maxY) maxY = y;
+                        sumX += x;
+                        sumY += y;
+                        sumW++;
+                        blobPixels.push({x, y, gray});
+                    }
+                }
+            }
+
+            const blobDetected = (sumW >= MIN_BLOB_AREA);
+
+            // Обнаружение переднего фронта вспышки (переход из false в true)
+            if (blobDetected && !prevBlobDetected) {
+                // Началась вспышка – ждём 20 мс и делаем повторный захват для стабильности
+                setTimeout(() => {
+                    captureAndCompute();
+                }, 20);
+            }
+
+            prevBlobDetected = blobDetected;
+
+            requestAnimationFrame(processFrame);
+        }
+
+        // Захват кадра в момент стабильной вспышки и вычисление координат
+        function captureAndCompute() {
+            if (!scanning) return;
+
+            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+            const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+            const data = imageData.data;
+
+            // Поиск связной яркой области (простой метод – bounding box)
+            let minX = canvas.width, maxX = -1, minY = canvas.height, maxY = -1;
+            let sumX = 0, sumY = 0, sumW = 0;
+            let found = false;
+
+            for (let y = 0; y < canvas.height; y++) {
+                for (let x = 0; x < canvas.width; x++) {
+                    const idx = (y * canvas.width + x) * 4;
+                    const gray = 0.299 * data[idx] + 0.587 * data[idx+1] + 0.114 * data[idx+2];
+                    if (gray > BRIGHTNESS_THRESHOLD) {
+                        if (x < minX) minX = x;
+                        if (x > maxX) maxX = x;
+                        if (y < minY) minY = y;
+                        if (y > maxY) maxY = y;
+                        sumX += x;
+                        sumY += y;
+                        sumW++;
+                        found = true;
+                    }
+                }
+            }
+
+            if (!found || sumW < MIN_BLOB_AREA) return;
+
+            // Центр пятна (среднее арифметическое координат ярких пикселей)
+            const cx_img = sumX / sumW;
+            const cy_img = sumY / sumW;
+
+            // Видимый диаметр (диагональ bounding box, для круглого пятна можно взять среднее сторон)
+            const widthPix = maxX - minX;
+            const heightPix = maxY - minY;
+            const diameterPix = (widthPix + heightPix) / 2; // усреднение
+
+            // Вычисление глубины Z (расстояние до шарика в мм)
+            // Формула: Z = f_pix * D_real / d_pix
+            const Z = (FOCAL_LENGTH_PIX * REAL_BALL_DIAMETER) / diameterPix;
+
+            // Вычисление X и Y в мм относительно оптической оси
+            const X = (cx_img - CX) * Z / FOCAL_LENGTH_PIX;
+            const Y = (cy_img - CY) * Z / FOCAL_LENGTH_PIX;
+
+            // Сохраняем точку
+            points3D.push({ x: X.toFixed(2), y: Y.toFixed(2), z: Z.toFixed(2) });
+            outputDiv.textContent = `Найдено точек: ${points3D.length}\n` +
+                points3D.map(p => `(${p.x}, ${p.y}, ${p.z})`).join('\n');
+        }
+
+        // Обработчики кнопок
+        document.getElementById('startBtn').addEventListener('click', () => {
+            scanning = true;
+            prevBlobDetected = false;
+            points3D = [];
+            outputDiv.textContent = 'Сканирование...';
+            requestAnimationFrame(processFrame);
+        });
+
+        document.getElementById('stopBtn').addEventListener('click', () => {
+            scanning = false;
+        });
+
+        // Инициализация
+        window.addEventListener('load', async () => {
+            await initCamera();
+        });
+    </script>
+</body>
+</html>

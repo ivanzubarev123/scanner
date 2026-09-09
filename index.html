@@ -1,195 +1,668 @@
 <!DOCTYPE html>
-<html>
+<html lang="ru">
 <head>
-    <meta charset="UTF-8">
-    <title>3D локализация светодиодных шариков</title>
-    <style>
-        body { font-family: Arial; margin: 20px; }
-        video, canvas { border: 1px solid #ccc; }
-        #output { margin-top: 10px; white-space: pre-wrap; }
-    </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Сканер гирлянды — 3D-координаты</title>
+<style>
+  :root {
+    --bg: #12141c;
+    --panel: #1a1d27;
+    --panel-alt: #1f2330;
+    --border: #2c3040;
+    --text: #e8e6e1;
+    --text-dim: #8b8d98;
+    --amber: #ffc24b;
+    --teal: #5eead4;
+    --red: #e4572e;
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --mono: ui-monospace, "SF Mono", "Cascadia Code", Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    line-height: 1.5;
+  }
+  .app { max-width: 1180px; margin: 0 auto; padding: 28px 20px 60px; }
+  header { margin-bottom: 22px; }
+  header h1 { font-size: 21px; font-weight: 600; margin: 0 0 6px; letter-spacing: -0.01em; }
+  header p { color: var(--text-dim); margin: 0; font-size: 14px; max-width: 68ch; }
+  .warning {
+    margin-top: 12px; padding: 10px 14px; border: 1px solid var(--red);
+    color: var(--red); font-size: 13px; background: rgba(228,87,46,0.08);
+  }
+  main { display: grid; grid-template-columns: 1.15fr 0.85fr; gap: 20px; align-items: start; }
+  @media (max-width: 880px) { main { grid-template-columns: 1fr; } }
+
+  .video-wrap {
+    position: relative; background: #000; border: 1px solid var(--border);
+    overflow: hidden; aspect-ratio: 4 / 3;
+  }
+  video { width: 100%; height: 100%; object-fit: contain; display: block; }
+  #overlay { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+
+  .log {
+    margin-top: 14px; height: 160px; overflow-y: auto;
+    border: 1px solid var(--border); background: var(--panel);
+    padding: 10px 12px; font-family: var(--mono); font-size: 12px; color: var(--text-dim);
+  }
+  .log div { padding: 1px 0; }
+
+  .panel { border: 1px solid var(--border); background: var(--panel); padding: 20px; margin-bottom: 20px; }
+  .panel h2 { font-size: 15px; font-weight: 600; margin: 0 0 10px; }
+  .panel .hint { color: var(--text-dim); font-size: 13px; margin: 0 0 16px; max-width: 60ch; }
+
+  .row { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 10px; }
+
+  button {
+    font-family: var(--sans); font-size: 13px; padding: 9px 16px;
+    background: var(--panel-alt); color: var(--text); border: 1px solid var(--border); cursor: pointer;
+  }
+  button:hover:not(:disabled) { border-color: var(--teal); }
+  button:disabled { opacity: 0.45; cursor: default; }
+  button.primary { background: var(--amber); color: #221a08; border-color: var(--amber); font-weight: 600; }
+  button.primary:hover:not(:disabled) { filter: brightness(1.08); }
+  button:focus-visible { outline: 2px solid var(--teal); outline-offset: 2px; }
+
+  .progress { height: 6px; background: var(--panel-alt); border: 1px solid var(--border); margin-bottom: 8px; overflow: hidden; }
+  .progress-bar { height: 100%; background: var(--amber); width: 0%; transition: width 0.15s linear; }
+  @media (prefers-reduced-motion: reduce) { .progress-bar { transition: none; } }
+
+  .mono { font-family: var(--mono); font-size: 13px; }
+
+  .field { display: block; font-size: 13px; color: var(--text-dim); margin-bottom: 14px; }
+  .field input[type="number"] {
+    display: block; margin-top: 6px; width: 100%; padding: 7px 10px;
+    background: var(--panel-alt); border: 1px solid var(--border); color: var(--text); font-family: var(--mono);
+  }
+  .field input[type="checkbox"] { margin-right: 6px; }
+
+  #viewer3d { width: 100%; display: block; background: var(--panel-alt); border: 1px solid var(--border); touch-action: none; cursor: grab; }
+</style>
 </head>
 <body>
-    <h2>Локализация светящихся шариков</h2>
-    <video id="video" width="640" height="480" autoplay playsinline></video>
-    <canvas id="canvas" width="640" height="480"></canvas>
-    <div id="output"></div>
-    <button id="startBtn">Начать сканирование</button>
-    <button id="stopBtn">Остановить</button>
+<div class="app">
+  <header>
+    <h1>Сканер гирлянды: восстановление 3D-координат</h1>
+    <p>Два прохода вспышками, синхронизированных по Serial с Arduino, дают X, Y и Z каждого шарика — по индексу светодиода, без сопоставления вручную.</p>
+    <div class="warning" id="apiWarning" hidden></div>
+  </header>
+  <main>
+    <div>
+      <div class="video-wrap">
+        <video id="video" autoplay playsinline muted></video>
+        <canvas id="overlay"></canvas>
+      </div>
+      <canvas id="captureCanvas" hidden></canvas>
+      <div class="log" id="log"></div>
+    </div>
+    <div>
+      <div class="panel" id="controlPanel"></div>
+      <div class="panel">
+        <h2>Облако точек</h2>
+        <canvas id="viewer3d" width="440" height="380"></canvas>
+        <p class="hint" style="margin-top:10px; margin-bottom:0;">Перетаскивание вращает, колесо мыши — масштаб.</p>
+      </div>
+    </div>
+  </main>
+</div>
 
-    <script>
-        // ---------- ПАРАМЕТРЫ КАЛИБРОВКИ (настраиваются пользователем) ----------
-        const REAL_BALL_DIAMETER = 10;   // реальный диаметр шарика в мм
-        // Фокусное расстояние в пикселях. Можно получить калибровкой:
-        // f_pix = (ширина_объекта_в_пикселях * расстояние_до_объекта_мм) / реальная_ширина_объекта_мм
-        const FOCAL_LENGTH_PIX = 800;    // примерное значение, замените своим
-        // Оптический центр камеры (обычно центр изображения)
-        const CX = 320;                  // половина ширины кадра
-        const CY = 240;                  // половина высоты кадра
-        // Порог яркости для детектирования вспышки (0-255)
-        const BRIGHTNESS_THRESHOLD = 200;
-        // Минимальная площадь пятна (в пикселях), чтобы игнорировать шумы
-        const MIN_BLOB_AREA = 20;
-        // ----------------------------------------------------------------------
+<script>
+'use strict';
 
-        const video = document.getElementById('video');
-        const canvas = document.getElementById('canvas');
-        const ctx = canvas.getContext('2d', { willReadFrequently: true });
-        const outputDiv = document.getElementById('output');
+// ==================== НАСТРОЙКИ АЛГОРИТМА ====================
+const MIN_FLASH_BRIGHTNESS = 15;   // мин. яркость разницы (0-255), чтобы считать вспышку обнаруженной
+const THRESHOLD_RATIO      = 0.5;  // доля от пикового значения для включения пикселя в центроид
+const MAX_BLOB_FRACTION    = 0.25; // если "пятно" больше этой доли кадра — считаем это ошибкой (засветка/движение)
+const FRAME_SKIP           = 1;    // сколько новых кадров видео пропустить после события перед захватом
 
-        let scanning = false;
-        let prevBlobDetected = false;
-        let points3D = [];          // массив найденных точек {x, y, z}
-        let lastFrameTime = 0;
-        let frameInterval = 30;     // ~33 fps
+// ==================== СОСТОЯНИЕ ====================
+const state = {
+  port: null, writer: null, reader: null, serialConnected: false,
+  cameraStream: null, cameraConnected: false,
+  phase: 'connect', // connect -> pass1-ready -> pass1-scanning -> pass1-done -> rotate -> pass2-scanning -> results
+  pass1: [], pass2: [],
+  pass1Size: null, pass2Size: null,
+  progressDone: 0, progressTotal: 0,
+  invertZ: false,
+  scaleUnitsPerPixel: 1,
+  points: []
+};
 
-        // Запуск видеопотока
-        async function initCamera() {
-            try {
-                const stream = await navigator.mediaDevices.getUserMedia({
-                    video: { width: 640, height: 480, facingMode: 'environment' },
-                    audio: false
-                });
-                video.srcObject = stream;
-                await video.play();
-                console.log('Камера запущена');
-            } catch (err) {
-                console.error('Ошибка доступа к камере:', err);
-            }
+// ==================== DOM ====================
+const videoEl = document.getElementById('video');
+const overlayEl = document.getElementById('overlay');
+const captureCanvas = document.getElementById('captureCanvas');
+const controlPanel = document.getElementById('controlPanel');
+const logEl = document.getElementById('log');
+const viewerCanvas = document.getElementById('viewer3d');
+const apiWarning = document.getElementById('apiWarning');
+
+function appendLog(msg) {
+  const time = new Date().toLocaleTimeString('ru-RU', { hour12: false });
+  const line = document.createElement('div');
+  line.textContent = `[${time}] ${msg}`;
+  logEl.appendChild(line);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+// ==================== SERIAL: очередь строк, устойчивая к гонкам ====================
+// Строка, пришедшая до того, как её кто-то ждёт, не теряется — она попадает в
+// очередь, и waitForLine сначала проверяет очередь, потом уже подписывается.
+const lineQueue = [];
+const lineListeners = new Set();
+
+function dispatchLine(line) {
+  appendLog('« ' + line);
+  let consumed = false;
+  for (const cb of lineListeners) {
+    if (cb(line)) { consumed = true; break; }
+  }
+  if (!consumed) {
+    lineQueue.push(line);
+    if (lineQueue.length > 50) lineQueue.shift();
+  }
+}
+
+function waitForLine(predicate, timeoutMs = 5000) {
+  for (let i = 0; i < lineQueue.length; i++) {
+    if (predicate(lineQueue[i])) {
+      return Promise.resolve(lineQueue.splice(i, 1)[0]);
+    }
+  }
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      lineListeners.delete(listener);
+      reject(new Error('таймаут ожидания ответа от Arduino'));
+    }, timeoutMs);
+    const listener = (line) => {
+      if (!predicate(line)) return false;
+      clearTimeout(timer);
+      lineListeners.delete(listener);
+      resolve(line);
+      return true;
+    };
+    lineListeners.add(listener);
+  });
+}
+
+async function connectSerial() {
+  try {
+    const port = await navigator.serial.requestPort();
+    await port.open({ baudRate: 115200 });
+    state.port = port;
+    state.writer = port.writable.getWriter();
+    state.serialConnected = true;
+    appendLog('Arduino подключён по Serial');
+    readSerialLoop();
+  } catch (e) {
+    appendLog('Не удалось подключить Arduino: ' + e.message);
+  }
+}
+
+async function sendLine(text) {
+  if (!state.writer) return;
+  await state.writer.write(new TextEncoder().encode(text + '\n'));
+}
+
+async function readSerialLoop() {
+  let buffer = '';
+  const decoder = new TextDecoder();
+  try {
+    while (state.port && state.port.readable) {
+      const reader = state.port.readable.getReader();
+      state.reader = reader;
+      try {
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          let idx;
+          while ((idx = buffer.indexOf('\n')) >= 0) {
+            const line = buffer.slice(0, idx).trim();
+            buffer = buffer.slice(idx + 1);
+            if (line) dispatchLine(line);
+          }
         }
+      } finally {
+        reader.releaseLock();
+      }
+    }
+  } catch (e) {
+    appendLog('Serial отключён: ' + e.message);
+    state.serialConnected = false;
+  }
+}
 
-        // Захват кадра и обработка
-        function processFrame() {
-            if (!scanning) {
-                requestAnimationFrame(processFrame);
-                return;
-            }
+// ==================== КАМЕРА ====================
+async function connectCamera() {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: { ideal: 1280 }, height: { ideal: 720 } },
+      audio: false
+    });
+    state.cameraStream = stream;
+    videoEl.srcObject = stream;
+    await videoEl.play();
+    state.cameraConnected = true;
+    // подгоняем контейнер под реальное соотношение сторон камеры,
+    // чтобы оверлей с прицелом совпадал с картинкой без леттербоксинга
+    document.querySelector('.video-wrap').style.aspectRatio = `${videoEl.videoWidth} / ${videoEl.videoHeight}`;
+    resizeOverlay();
+    appendLog(`Камера подключена: ${videoEl.videoWidth}×${videoEl.videoHeight}`);
+  } catch (e) {
+    appendLog('Не удалось подключить камеру: ' + e.message);
+  }
+}
 
-            const now = performance.now();
-            if (now - lastFrameTime < frameInterval) {
-                requestAnimationFrame(processFrame);
-                return;
-            }
-            lastFrameTime = now;
+function resizeOverlay() {
+  overlayEl.width = videoEl.videoWidth;
+  overlayEl.height = videoEl.videoHeight;
+}
 
-            // Рисуем текущий кадр видео на canvas
-            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-            const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-            const data = imageData.data;
+function waitNextVideoFrame() {
+  return new Promise(resolve => {
+    if (videoEl.requestVideoFrameCallback) {
+      videoEl.requestVideoFrameCallback(() => resolve());
+    } else {
+      requestAnimationFrame(() => resolve());
+    }
+  });
+}
 
-            // Поиск ярких пикселей
-            let minX = canvas.width, maxX = -1, minY = canvas.height, maxY = -1;
-            let sumX = 0, sumY = 0, sumW = 0;
-            let blobPixels = [];
+function grabCurrentFrame() {
+  const w = videoEl.videoWidth, h = videoEl.videoHeight;
+  captureCanvas.width = w;
+  captureCanvas.height = h;
+  const ctx = captureCanvas.getContext('2d', { willReadFrequently: true });
+  ctx.drawImage(videoEl, 0, 0, w, h);
+  return ctx.getImageData(0, 0, w, h);
+}
 
-            for (let y = 0; y < canvas.height; y++) {
-                for (let x = 0; x < canvas.width; x++) {
-                    const idx = (y * canvas.width + x) * 4;
-                    const r = data[idx];
-                    const g = data[idx + 1];
-                    const b = data[idx + 2];
-                    const gray = 0.299 * r + 0.587 * g + 0.114 * b; // яркость
-                    if (gray > BRIGHTNESS_THRESHOLD) {
-                        // Если пиксель яркий, считаем его частью вспышки
-                        if (x < minX) minX = x;
-                        if (x > maxX) maxX = x;
-                        if (y < minY) minY = y;
-                        if (y > maxY) maxY = y;
-                        sumX += x;
-                        sumY += y;
-                        sumW++;
-                        blobPixels.push({x, y, gray});
-                    }
-                }
-            }
+async function captureFrame() {
+  for (let i = 0; i < FRAME_SKIP; i++) await waitNextVideoFrame();
+  return grabCurrentFrame();
+}
 
-            const blobDetected = (sumW >= MIN_BLOB_AREA);
+// ==================== ОБРАБОТКА ИЗОБРАЖЕНИЯ ====================
+// Разница яркости "вспышка минус фон" + взвешенный центроид даёт субпиксельную
+// точность локализации без необходимости в connected-component labeling —
+// этого достаточно, пока в кадре ровно одно яркое пятно.
+function diffAndCentroid(bg, flash) {
+  const w = flash.width, h = flash.height;
+  const bd = bg.data, fd = flash.data;
+  const diff = new Float32Array(w * h);
+  let maxDiff = 0;
 
-            // Обнаружение переднего фронта вспышки (переход из false в true)
-            if (blobDetected && !prevBlobDetected) {
-                // Началась вспышка – ждём 20 мс и делаем повторный захват для стабильности
-                setTimeout(() => {
-                    captureAndCompute();
-                }, 20);
-            }
+  for (let p = 0, i = 0; p < diff.length; p++, i += 4) {
+    const lumF = 0.299 * fd[i] + 0.587 * fd[i + 1] + 0.114 * fd[i + 2];
+    const lumB = 0.299 * bd[i] + 0.587 * bd[i + 1] + 0.114 * bd[i + 2];
+    const d = lumF - lumB;
+    const dd = d > 0 ? d : 0;
+    diff[p] = dd;
+    if (dd > maxDiff) maxDiff = dd;
+  }
 
-            prevBlobDetected = blobDetected;
+  if (maxDiff < MIN_FLASH_BRIGHTNESS) {
+    return { u: null, v: null, detected: false, strength: maxDiff };
+  }
 
-            requestAnimationFrame(processFrame);
-        }
+  const threshold = maxDiff * THRESHOLD_RATIO;
+  let sumW = 0, sumX = 0, sumY = 0, count = 0;
+  for (let y = 0; y < h; y++) {
+    const rowOff = y * w;
+    for (let x = 0; x < w; x++) {
+      const d = diff[rowOff + x];
+      if (d >= threshold) {
+        sumW += d; sumX += d * x; sumY += d * y; count++;
+      }
+    }
+  }
 
-        // Захват кадра в момент стабильной вспышки и вычисление координат
-        function captureAndCompute() {
-            if (!scanning) return;
+  if (count === 0 || count > w * h * MAX_BLOB_FRACTION) {
+    return { u: null, v: null, detected: false, strength: maxDiff };
+  }
 
-            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-            const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-            const data = imageData.data;
+  return { u: sumX / sumW, v: sumY / sumW, detected: true, strength: maxDiff, pixelCount: count };
+}
 
-            // Поиск связной яркой области (простой метод – bounding box)
-            let minX = canvas.width, maxX = -1, minY = canvas.height, maxY = -1;
-            let sumX = 0, sumY = 0, sumW = 0;
-            let found = false;
+function drawOverlay(point) {
+  const ctx = overlayEl.getContext('2d');
+  ctx.clearRect(0, 0, overlayEl.width, overlayEl.height);
+  if (!point || !point.detected) return;
+  const { u, v } = point;
+  ctx.strokeStyle = '#ffc24b';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(u - 14, v); ctx.lineTo(u + 14, v);
+  ctx.moveTo(u, v - 14); ctx.lineTo(u, v + 14);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.arc(u, v, 8, 0, Math.PI * 2);
+  ctx.stroke();
+}
 
-            for (let y = 0; y < canvas.height; y++) {
-                for (let x = 0; x < canvas.width; x++) {
-                    const idx = (y * canvas.width + x) * 4;
-                    const gray = 0.299 * data[idx] + 0.587 * data[idx+1] + 0.114 * data[idx+2];
-                    if (gray > BRIGHTNESS_THRESHOLD) {
-                        if (x < minX) minX = x;
-                        if (x > maxX) maxX = x;
-                        if (y < minY) minY = y;
-                        if (y > maxY) maxY = y;
-                        sumX += x;
-                        sumY += y;
-                        sumW++;
-                        found = true;
-                    }
-                }
-            }
+// ==================== ОРКЕСТРАЦИЯ ПРОХОДА ====================
+function updateProgress(done, total) {
+  state.progressDone = done;
+  state.progressTotal = total;
+  const bar = document.getElementById('progressBar');
+  const label = document.getElementById('progressLabel');
+  if (bar) bar.style.width = (total ? (done / total * 100) : 0) + '%';
+  if (label) label.textContent = `${done} / ${total}`;
+}
 
-            if (!found || sumW < MIN_BLOB_AREA) return;
+async function runPass(passNumber) {
+  const results = [];
+  appendLog(`— Проход ${passNumber}: старт —`);
 
-            // Центр пятна (среднее арифметическое координат ярких пикселей)
-            const cx_img = sumX / sumW;
-            const cy_img = sumY / sumW;
+  drawOverlay(null);
+  let bgFrame = await captureFrame(); // фон при полностью погашенной гирлянде
 
-            // Видимый диаметр (диагональ bounding box, для круглого пятна можно взять среднее сторон)
-            const widthPix = maxX - minX;
-            const heightPix = maxY - minY;
-            const diameterPix = (widthPix + heightPix) / 2; // усреднение
+  await sendLine('START');
+  const startLine = await waitForLine(l => l.startsWith('SCAN_START'), 5000);
+  const n = parseInt(startLine.split(' ')[1], 10);
+  updateProgress(0, n);
 
-            // Вычисление глубины Z (расстояние до шарика в мм)
-            // Формула: Z = f_pix * D_real / d_pix
-            const Z = (FOCAL_LENGTH_PIX * REAL_BALL_DIAMETER) / diameterPix;
+  for (let i = 0; i < n; i++) {
+    await waitForLine(l => l === `ON ${i}`, 5000);
+    const onFrame = await captureFrame();
+    const centroid = diffAndCentroid(bgFrame, onFrame);
+    results[i] = centroid;
+    drawOverlay(centroid);
 
-            // Вычисление X и Y в мм относительно оптической оси
-            const X = (cx_img - CX) * Z / FOCAL_LENGTH_PIX;
-            const Y = (cy_img - CY) * Z / FOCAL_LENGTH_PIX;
+    await sendLine('ACK');
+    await waitForLine(l => l === `OFF ${i}`, 5000);
+    bgFrame = await captureFrame(); // кадр сразу после выключения — свежий фон для следующего светодиода
+    updateProgress(i + 1, n);
+  }
 
-            // Сохраняем точку
-            points3D.push({ x: X.toFixed(2), y: Y.toFixed(2), z: Z.toFixed(2) });
-            outputDiv.textContent = `Найдено точек: ${points3D.length}\n` +
-                points3D.map(p => `(${p.x}, ${p.y}, ${p.z})`).join('\n');
-        }
+  await waitForLine(l => l === 'SCAN_DONE', 3000).catch(() => {});
+  const detectedCount = results.filter(r => r.detected).length;
+  appendLog(`— Проход ${passNumber}: готово, обнаружено ${detectedCount}/${n} —`);
+  return results;
+}
 
-        // Обработчики кнопок
-        document.getElementById('startBtn').addEventListener('click', () => {
-            scanning = true;
-            prevBlobDetected = false;
-            points3D = [];
-            outputDiv.textContent = 'Сканирование...';
-            requestAnimationFrame(processFrame);
-        });
+// ==================== ОБЪЕДИНЕНИЕ ДВУХ ПРОХОДОВ В X,Y,Z ====================
+// Проход 1 (вид спереди): горизонталь кадра → X, вертикаль → Y.
+// Проход 2 (вид сбоку, после поворота на 90°): горизонталь кадра → Z, вертикаль → Y.
+// Соответствие точек между проходами — по индексу светодиода, поэтому
+// сложная задача stereo correspondence здесь просто не возникает.
+function computePoints() {
+  const n = Math.max(state.pass1.length, state.pass2.length);
+  const s1 = state.pass1Size, s2 = state.pass2Size;
+  const cx1 = s1 ? s1.w / 2 : 0, cy1 = s1 ? s1.h / 2 : 0;
+  const cx2 = s2 ? s2.w / 2 : 0, cy2 = s2 ? s2.h / 2 : 0;
+  const zSign = state.invertZ ? -1 : 1;
+  const scale = state.scaleUnitsPerPixel || 1;
 
-        document.getElementById('stopBtn').addEventListener('click', () => {
-            scanning = false;
-        });
+  const points = [];
+  for (let i = 0; i < n; i++) {
+    const p1 = state.pass1[i];
+    const p2 = state.pass2[i];
+    const d1 = !!(p1 && p1.detected);
+    const d2 = !!(p2 && p2.detected);
 
-        // Инициализация
-        window.addEventListener('load', async () => {
-            await initCamera();
-        });
-    </script>
+    if (!d1 && !d2) {
+      points.push({ index: i, x: null, y: null, z: null, detected1: false, detected2: false, complete: false });
+      continue;
+    }
+
+    const x = d1 ? (p1.u - cx1) * scale : null;
+    const z = d2 ? (p2.u - cx2) * scale * zSign : null;
+    let y;
+    if (d1 && d2) y = -(((p1.v - cy1) + (p2.v - cy2)) / 2) * scale;
+    else if (d1) y = -(p1.v - cy1) * scale;
+    else y = -(p2.v - cy2) * scale;
+
+    points.push({ index: i, x, y, z, detected1: d1, detected2: d2, complete: d1 && d2 });
+  }
+  state.points = points;
+  return points;
+}
+
+// ==================== 3D-ПРОСМОТРЩИК (canvas 2D, свой прожектор) ====================
+const viewer = { yaw: 0.6, pitch: -0.3, zoom: 1, dragging: false, lastX: 0, lastY: 0 };
+
+function initViewer() {
+  viewerCanvas.addEventListener('mousedown', e => { viewer.dragging = true; viewer.lastX = e.clientX; viewer.lastY = e.clientY; });
+  window.addEventListener('mouseup', () => viewer.dragging = false);
+  window.addEventListener('mousemove', e => {
+    if (!viewer.dragging) return;
+    viewer.yaw += (e.clientX - viewer.lastX) * 0.01;
+    viewer.pitch = Math.max(-1.5, Math.min(1.5, viewer.pitch + (e.clientY - viewer.lastY) * 0.01));
+    viewer.lastX = e.clientX; viewer.lastY = e.clientY;
+    renderViewer();
+  });
+  viewerCanvas.addEventListener('wheel', e => {
+    e.preventDefault();
+    viewer.zoom = Math.max(0.2, Math.min(5, viewer.zoom * (e.deltaY < 0 ? 1.08 : 0.93)));
+    renderViewer();
+  }, { passive: false });
+
+  let touchLast = null;
+  viewerCanvas.addEventListener('touchstart', e => { touchLast = e.touches[0]; }, { passive: true });
+  viewerCanvas.addEventListener('touchmove', e => {
+    if (!touchLast) return;
+    const t = e.touches[0];
+    viewer.yaw += (t.clientX - touchLast.clientX) * 0.01;
+    viewer.pitch = Math.max(-1.5, Math.min(1.5, viewer.pitch + (t.clientY - touchLast.clientY) * 0.01));
+    touchLast = t;
+    renderViewer();
+  }, { passive: true });
+  viewerCanvas.addEventListener('touchend', () => touchLast = null);
+}
+
+function project(p, cx, cy, scale) {
+  const cosY = Math.cos(viewer.yaw), sinY = Math.sin(viewer.yaw);
+  const cosP = Math.cos(viewer.pitch), sinP = Math.sin(viewer.pitch);
+  let x = p.x * cosY - p.z * sinY;
+  let z = p.x * sinY + p.z * cosY;
+  const y = p.y * cosP - z * sinP;
+  z = p.y * sinP + z * cosP;
+  const camDist = 600;
+  const f = camDist / (camDist + z);
+  return { sx: cx + x * scale * f * viewer.zoom, sy: cy - y * scale * f * viewer.zoom, depth: z, f };
+}
+
+function renderViewer() {
+  const ctx = viewerCanvas.getContext('2d');
+  const w = viewerCanvas.width, h = viewerCanvas.height;
+  ctx.clearRect(0, 0, w, h);
+
+  const pts = state.points.filter(p => p.x !== null || p.z !== null);
+  if (pts.length === 0) return;
+
+  let maxAbs = 1;
+  for (const p of pts) maxAbs = Math.max(maxAbs, Math.abs(p.x || 0), Math.abs(p.y || 0), Math.abs(p.z || 0));
+  const scale = (Math.min(w, h) * 0.35) / maxAbs;
+
+  const projected = pts
+    .map(p => Object.assign(project({ x: p.x || 0, y: p.y || 0, z: p.z || 0 }, w / 2, h / 2, scale), { complete: p.complete }))
+    .sort((a, b) => a.depth - b.depth);
+
+  for (const pp of projected) {
+    const r = Math.max(2, 5 * pp.f);
+    ctx.beginPath();
+    ctx.arc(pp.sx, pp.sy, r, 0, Math.PI * 2);
+    ctx.fillStyle = pp.complete ? 'rgba(94, 234, 212, 0.9)' : 'rgba(139, 141, 152, 0.55)';
+    ctx.fill();
+  }
+}
+
+// ==================== ЭКСПОРТ ====================
+function downloadBlob(content, filename, type) {
+  const blob = new Blob([content], { type });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+function exportJSON() {
+  const data = {
+    generated: new Date().toISOString(),
+    led_count: state.points.length,
+    scale_units_per_pixel: state.scaleUnitsPerPixel,
+    invert_z: state.invertZ,
+    points: state.points
+  };
+  downloadBlob(JSON.stringify(data, null, 2), 'led_coordinates.json', 'application/json');
+}
+
+function exportCSV() {
+  const rows = ['index,x,y,z,detected_pass1,detected_pass2'];
+  for (const p of state.points) {
+    rows.push([p.index, p.x ?? '', p.y ?? '', p.z ?? '', p.detected1, p.detected2].join(','));
+  }
+  downloadBlob(rows.join('\n'), 'led_coordinates.csv', 'text/csv');
+}
+
+// ==================== ИНТЕРФЕЙС (простая машина состояний) ====================
+function progressPct() { return state.progressTotal ? (state.progressDone / state.progressTotal * 100) : 0; }
+function countDetected(arr) { return arr.filter(r => r && r.detected).length; }
+
+function render() {
+  switch (state.phase) {
+    case 'connect':
+      controlPanel.innerHTML = `
+        <h2>Шаг 1 · Подключение</h2>
+        <p class="hint">Нужны оба устройства, прежде чем начать сканирование.</p>
+        <div class="row">
+          <button data-action="connectSerial" ${state.serialConnected ? 'disabled' : ''}>${state.serialConnected ? '✓ Arduino подключен' : 'Подключить Arduino'}</button>
+          <button data-action="connectCamera" ${state.cameraConnected ? 'disabled' : ''}>${state.cameraConnected ? '✓ Камера подключена' : 'Подключить камеру'}</button>
+        </div>
+        <button data-action="toPass1Ready" class="primary" ${(state.serialConnected && state.cameraConnected) ? '' : 'disabled'}>Далее</button>
+      `;
+      break;
+
+    case 'pass1-ready':
+      controlPanel.innerHTML = `
+        <h2>Шаг 2 · Проход 1 — вид спереди</h2>
+        <p class="hint">Направьте камеру на стакан спереди и зафиксируйте её — во время всего прохода она не должна двигаться. Приглушите свет в комнате и уберите блестящие поверхности из кадра, это сильно повышает точность.</p>
+        <button data-action="startPass1" class="primary">Начать проход 1</button>
+      `;
+      break;
+
+    case 'pass1-scanning':
+    case 'pass2-scanning': {
+      const n = state.phase === 'pass1-scanning' ? 1 : 2;
+      controlPanel.innerHTML = `
+        <h2>Проход ${n} выполняется</h2>
+        <div class="progress"><div class="progress-bar" id="progressBar" style="width:${progressPct()}%"></div></div>
+        <p class="mono" id="progressLabel">${state.progressDone} / ${state.progressTotal}</p>
+        <p class="hint">Не двигайте камеру и стакан до конца прохода.</p>
+      `;
+      break;
+    }
+
+    case 'pass1-done':
+      controlPanel.innerHTML = `
+        <h2>Проход 1 завершён</h2>
+        <p class="mono">Обнаружено: ${countDetected(state.pass1)} / ${state.pass1.length}</p>
+        <div class="row">
+          <button data-action="redoPass1">Повторить</button>
+          <button data-action="toRotate" class="primary">Далее — повернуть на 90°</button>
+        </div>
+      `;
+      break;
+
+    case 'rotate':
+      controlPanel.innerHTML = `
+        <h2>Шаг 3 · Поворот на 90°</h2>
+        <p class="hint">Теперь камера должна смотреть на стакан сбоку — перпендикулярно первому проходу. Проще и точнее повернуть сам стакан на отмеченном месте (например, на листе с прочерченным углом), оставив камеру неподвижной. Расстояние до стакана и зум камеры оставьте такими же, как в проходе 1 — так X, Y и Z получатся в одном масштабе.</p>
+        <button data-action="startPass2" class="primary">Готово, начать проход 2</button>
+      `;
+      break;
+
+    case 'results': {
+      const complete = state.points.filter(p => p.complete).length;
+      controlPanel.innerHTML = `
+        <h2>Результат</h2>
+        <p class="mono">Полностью определены (обе оси): ${complete} / ${state.points.length}</p>
+        <label class="field"><input type="checkbox" data-action="toggleInvertZ" ${state.invertZ ? 'checked' : ''}> Инвертировать ось Z (если облако выглядит зеркальным)</label>
+        <label class="field">Масштаб, единиц/пиксель
+          <input type="number" class="mono" data-action="setScale" value="${state.scaleUnitsPerPixel}" step="0.001" min="0.0001">
+        </label>
+        <div class="row">
+          <button data-action="exportJSON">Скачать JSON</button>
+          <button data-action="exportCSV">Скачать CSV</button>
+        </div>
+        <div class="row">
+          <button data-action="redoPass1">Повторить проход 1</button>
+          <button data-action="redoPass2">Повторить проход 2</button>
+        </div>
+      `;
+      renderViewer();
+      break;
+    }
+  }
+}
+
+controlPanel.addEventListener('click', e => { const a = e.target.dataset.action; if (a) handleAction(a, e.target); });
+controlPanel.addEventListener('change', e => { const a = e.target.dataset.action; if (a) handleAction(a, e.target); });
+
+async function handleAction(action, el) {
+  switch (action) {
+    case 'connectSerial': await connectSerial(); render(); break;
+    case 'connectCamera': await connectCamera(); render(); break;
+    case 'toPass1Ready': state.phase = 'pass1-ready'; render(); break;
+    case 'startPass1': await doScanPhase(1); break;
+    case 'redoPass1': state.phase = 'pass1-ready'; render(); break;
+    case 'toRotate': state.phase = 'rotate'; render(); break;
+    case 'startPass2': await doScanPhase(2); break;
+    case 'redoPass2': state.phase = 'rotate'; render(); break;
+    case 'toggleInvertZ': state.invertZ = el.checked; computePoints(); renderViewer(); break;
+    case 'setScale': state.scaleUnitsPerPixel = parseFloat(el.value) || 1; computePoints(); renderViewer(); break;
+    case 'exportJSON': exportJSON(); break;
+    case 'exportCSV': exportCSV(); break;
+  }
+}
+
+async function doScanPhase(passNum) {
+  state.phase = passNum === 1 ? 'pass1-scanning' : 'pass2-scanning';
+  render();
+  try {
+    const results = await runPass(passNum);
+    if (passNum === 1) {
+      state.pass1 = results;
+      state.pass1Size = { w: videoEl.videoWidth, h: videoEl.videoHeight };
+      state.phase = 'pass1-done';
+    } else {
+      state.pass2 = results;
+      state.pass2Size = { w: videoEl.videoWidth, h: videoEl.videoHeight };
+      state.phase = 'results';
+      computePoints();
+    }
+  } catch (e) {
+    appendLog('Ошибка сканирования: ' + e.message);
+    state.phase = passNum === 1 ? 'pass1-ready' : 'rotate';
+  }
+  render();
+}
+
+// ==================== ИНИЦИАЛИЗАЦИЯ ====================
+function checkAPIs() {
+  const missing = [];
+  if (!('serial' in navigator)) missing.push('Web Serial API');
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) missing.push('доступ к камере');
+  if (missing.length) {
+    apiWarning.hidden = false;
+    apiWarning.textContent = `Браузер не поддерживает: ${missing.join(', ')}. Откройте эту страницу в Chrome или Edge через http://localhost.`;
+  }
+}
+
+window.addEventListener('beforeunload', () => {
+  if (state.cameraStream) state.cameraStream.getTracks().forEach(t => t.stop());
+});
+
+checkAPIs();
+initViewer();
+render();
+</script>
 </body>
 </html>

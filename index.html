@@ -50,6 +50,7 @@
     padding: 10px 12px; font-family: var(--mono); font-size: 12px; color: var(--text-dim);
   }
   .log div { padding: 1px 0; }
+  .log div.warn { color: var(--amber); }
 
   .panel { border: 1px solid var(--border); background: var(--panel); padding: 20px; margin-bottom: 20px; }
   .panel h2 { font-size: 15px; font-weight: 600; margin: 0 0 10px; }
@@ -81,6 +82,15 @@
   .field input[type="checkbox"] { margin-right: 6px; }
 
   #viewer3d { width: 100%; display: block; background: var(--panel-alt); border: 1px solid var(--border); touch-action: none; cursor: grab; }
+
+  .legend { display: flex; gap: 16px; flex-wrap: wrap; font-size: 12px; color: var(--text-dim); margin-top: 10px; }
+  .legend span::before {
+    content: ''; display: inline-block; width: 9px; height: 9px; border-radius: 50%;
+    margin-right: 6px; vertical-align: middle;
+  }
+  .legend .l-ok::before   { background: rgba(94, 234, 212, 0.9); }
+  .legend .l-susp::before { background: rgba(255, 194, 75, 0.9); }
+  .legend .l-part::before { background: rgba(139, 141, 152, 0.55); }
 </style>
 </head>
 <body>
@@ -104,6 +114,11 @@
       <div class="panel">
         <h2>Облако точек</h2>
         <canvas id="viewer3d" width="440" height="380"></canvas>
+        <div class="legend">
+          <span class="l-ok">обе оси определены</span>
+          <span class="l-susp">подозрительная (окклюзия/блик)</span>
+          <span class="l-part">неполная</span>
+        </div>
         <p class="hint" style="margin-top:10px; margin-bottom:0;">Перетаскивание вращает, колесо мыши — масштаб.</p>
       </div>
     </div>
@@ -115,9 +130,20 @@
 
 // ==================== НАСТРОЙКИ АЛГОРИТМА ====================
 const MIN_FLASH_BRIGHTNESS = 15;   // мин. яркость разницы (0-255), чтобы считать вспышку обнаруженной
-const THRESHOLD_RATIO      = 0.5;  // доля от пикового значения для включения пикселя в центроид
+const THRESHOLD_RATIO      = 0.5;  // доля от пикового значения для включения пикселя в BFS-заливку
 const MAX_BLOB_FRACTION    = 0.25; // если "пятно" больше этой доли кадра — считаем это ошибкой (засветка/движение)
 const FRAME_SKIP           = 1;    // сколько новых кадров видео пропустить после события перед захватом
+
+const MIN_BLOB_PIXELS      = 3;    // пятно меньше этого числа пикселей игнорируем
+const ENABLE_BASELINE_CORRECTION = true; // вычитать медианный фон (шум сенсора, дрейф)
+
+// Пороги детектора окклюзии (сравнение каждого LED с медианой по всему проходу)
+const AREA_LOW_RATIO       = 0.5;  // пятно меньше этой доли медианы → подозрение
+const AREA_HIGH_RATIO      = 1.8;  // пятно больше этой доли медианы → подозрение
+const BRIGHTNESS_LOW_RATIO = 0.5;  // яркость ниже этой доли медианы → подозрение
+const ASPECT_RATIO_MAX     = 1.6;  // сильное вытягивание (серп) → подозрение
+const ASYMMETRY_MAX        = 0.35; // смещение центроида от центра bbox → подозрение
+const SECONDARY_PEAK_RATIO = 0.6;  // конкурирующее пятно ярче этой доли пика → блик от соседа
 
 // ==================== СОСТОЯНИЕ ====================
 const state = {
@@ -141,9 +167,10 @@ const logEl = document.getElementById('log');
 const viewerCanvas = document.getElementById('viewer3d');
 const apiWarning = document.getElementById('apiWarning');
 
-function appendLog(msg) {
+function appendLog(msg, isWarn = false) {
   const time = new Date().toLocaleTimeString('ru-RU', { hour12: false });
   const line = document.createElement('div');
+  if (isWarn) line.className = 'warn';
   line.textContent = `[${time}] ${msg}`;
   logEl.appendChild(line);
   logEl.scrollTop = logEl.scrollHeight;
@@ -199,7 +226,7 @@ async function connectSerial() {
     appendLog('Arduino подключён по Serial');
     readSerialLoop();
   } catch (e) {
-    appendLog('Не удалось подключить Arduino: ' + e.message);
+    appendLog('Не удалось подключить Arduino: ' + e.message, true);
   }
 }
 
@@ -232,7 +259,7 @@ async function readSerialLoop() {
       }
     }
   } catch (e) {
-    appendLog('Serial отключён: ' + e.message);
+    appendLog('Serial отключён: ' + e.message, true);
     state.serialConnected = false;
   }
 }
@@ -254,7 +281,7 @@ async function connectCamera() {
     resizeOverlay();
     appendLog(`Камера подключена: ${videoEl.videoWidth}×${videoEl.videoHeight}`);
   } catch (e) {
-    appendLog('Не удалось подключить камеру: ' + e.message);
+    appendLog('Не удалось подключить камеру: ' + e.message, true);
   }
 }
 
@@ -288,45 +315,137 @@ async function captureFrame() {
 }
 
 // ==================== ОБРАБОТКА ИЗОБРАЖЕНИЯ ====================
-// Разница яркости "вспышка минус фон" + взвешенный центроид даёт субпиксельную
-// точность локализации без необходимости в connected-component labeling —
-// этого достаточно, пока в кадре ровно одно яркое пятно.
-function diffAndCentroid(bg, flash) {
+
+function medianOf(float32arr) {
+  const sampleStep = Math.max(1, Math.floor(float32arr.length / 5000));
+  const sample = [];
+  for (let i = 0; i < float32arr.length; i += sampleStep) sample.push(float32arr[i]);
+  sample.sort((a, b) => a - b);
+  return sample[Math.floor(sample.length / 2)] || 0;
+}
+
+// Разница яркости "вспышка минус фон" + BFS-заливка от пика яркости.
+// Даёт центроид настоящего пятна (а не блика), его форму и метрики
+// для последующего детектора окклюзии.
+function analyzeFlash(bg, flash) {
   const w = flash.width, h = flash.height;
   const bd = bg.data, fd = flash.data;
-  const diff = new Float32Array(w * h);
-  let maxDiff = 0;
+  const n = w * h;
+  const diff = new Float32Array(n);
 
-  for (let p = 0, i = 0; p < diff.length; p++, i += 4) {
+  let maxDiff = 0, peakIdx = -1;
+  for (let p = 0, i = 0; p < n; p++, i += 4) {
     const lumF = 0.299 * fd[i] + 0.587 * fd[i + 1] + 0.114 * fd[i + 2];
     const lumB = 0.299 * bd[i] + 0.587 * bd[i + 1] + 0.114 * bd[i + 2];
     const d = lumF - lumB;
     const dd = d > 0 ? d : 0;
     diff[p] = dd;
-    if (dd > maxDiff) maxDiff = dd;
+    if (dd > maxDiff) { maxDiff = dd; peakIdx = p; }
   }
 
-  if (maxDiff < MIN_FLASH_BRIGHTNESS) {
-    return { u: null, v: null, detected: false, strength: maxDiff };
+  let baseline = 0;
+  if (ENABLE_BASELINE_CORRECTION) {
+    baseline = medianOf(diff);
+    if (baseline > 0) for (let p = 0; p < n; p++) diff[p] = Math.max(0, diff[p] - baseline);
+  }
+  const effectiveMax = maxDiff - baseline;
+
+  if (peakIdx < 0 || effectiveMax < MIN_FLASH_BRIGHTNESS) {
+    return { detected: false, u: null, v: null, strength: effectiveMax, area: 0,
+             aspectRatio: 1, asymmetry: 0, suspect: false, flags: [] };
   }
 
-  const threshold = maxDiff * THRESHOLD_RATIO;
+  const threshold = effectiveMax * THRESHOLD_RATIO;
+
+  const visited = new Uint8Array(n);
+  const stack = [peakIdx];
+  visited[peakIdx] = 1;
   let sumW = 0, sumX = 0, sumY = 0, count = 0;
-  for (let y = 0; y < h; y++) {
-    const rowOff = y * w;
-    for (let x = 0; x < w; x++) {
-      const d = diff[rowOff + x];
-      if (d >= threshold) {
-        sumW += d; sumX += d * x; sumY += d * y; count++;
-      }
-    }
+  let minX = w, maxX = -1, minY = h, maxY = -1;
+  const bx = [], by = [], bw = [];
+
+  while (stack.length) {
+    const p = stack.pop();
+    const d = diff[p];
+    if (d < threshold) continue;
+    const x = p % w, y = (p / w) | 0;
+    sumW += d; sumX += d * x; sumY += d * y; count++;
+    if (x < minX) minX = x; if (x > maxX) maxX = x;
+    if (y < minY) minY = y; if (y > maxY) maxY = y;
+    bx.push(x); by.push(y); bw.push(d);
+
+    if (x > 0)     { const q = p - 1; if (!visited[q]) { visited[q] = 1; stack.push(q); } }
+    if (x < w - 1) { const q = p + 1; if (!visited[q]) { visited[q] = 1; stack.push(q); } }
+    if (y > 0)     { const q = p - w; if (!visited[q]) { visited[q] = 1; stack.push(q); } }
+    if (y < h - 1) { const q = p + w; if (!visited[q]) { visited[q] = 1; stack.push(q); } }
   }
 
-  if (count === 0 || count > w * h * MAX_BLOB_FRACTION) {
-    return { u: null, v: null, detected: false, strength: maxDiff };
+  if (count < MIN_BLOB_PIXELS || count > w * h * MAX_BLOB_FRACTION) {
+    return { detected: false, u: null, v: null, strength: effectiveMax, area: count,
+             aspectRatio: 1, asymmetry: 0, suspect: false, flags: [] };
   }
 
-  return { u: sumX / sumW, v: sumY / sumW, detected: true, strength: maxDiff, pixelCount: count };
+  // Есть ли где-то ещё в кадре отдельное яркое пятно? Значит, наш выбор
+  // "какое пятно — настоящий светодиод" неоднозначен (блик от соседа).
+  // visited уже содержит и саму заливку, и её непосредственную кайму
+  // (пиксели, до которых BFS дошёл, но не принял по порогу) — так что здесь
+  // мы ищем именно ОТДЕЛЬНЫЙ от него источник света, а не его же тусклый край.
+  let secondaryPeak = 0;
+  for (let p = 0; p < n; p++) {
+    if (visited[p]) continue;
+    if (diff[p] > secondaryPeak) secondaryPeak = diff[p];
+  }
+  const multipleSpots = secondaryPeak >= effectiveMax * SECONDARY_PEAK_RATIO;
+
+  const u = sumX / sumW, v = sumY / sumW;
+
+  // Ковариационная матрица пятна (взвешенная яркостью) — из неё получаем
+  // собственные числа, они дают aspect ratio и ориентацию.
+  let Sxx = 0, Syy = 0, Sxy = 0;
+  for (let i = 0; i < bx.length; i++) {
+    const dx = bx[i] - u, dy = by[i] - v, dw = bw[i];
+    Sxx += dw * dx * dx; Syy += dw * dy * dy; Sxy += dw * dx * dy;
+  }
+  Sxx /= sumW; Syy /= sumW; Sxy /= sumW;
+  const tr = Sxx + Syy, det = Sxx * Syy - Sxy * Sxy;
+  const disc = Math.sqrt(Math.max(0, tr * tr / 4 - det));
+  const lambda1 = tr / 2 + disc, lambda2 = Math.max(tr / 2 - disc, 1e-6);
+  const aspectRatio = Math.sqrt(lambda1 / lambda2);
+
+  // Насколько центроид "уехал" от геометрического центра bbox. У полного
+  // круглого пятна это ~0, у серпа от перекрытия — заметно больше нуля.
+  const bboxCx = (minX + maxX) / 2, bboxCy = (minY + maxY) / 2;
+  const bboxDiag = Math.hypot(maxX - minX + 1, maxY - minY + 1);
+  const asymmetry = bboxDiag > 0 ? Math.hypot(u - bboxCx, v - bboxCy) / bboxDiag : 0;
+
+  const flags = multipleSpots ? ['несколько ярких пятен'] : [];
+  return { detected: true, u, v, strength: effectiveMax, area: count,
+           aspectRatio, asymmetry, suspect: flags.length > 0, flags };
+}
+
+// Дополняет (не перезаписывает) флаги, выставленные analyzeFlash для одного
+// кадра, статистикой по всему проходу: сравнивает каждое пятно с медианой
+// площади/яркости среди всех LED этого прохода — так частично перекрытый шар
+// выделяется на фоне остальных, даже если сам по себе его кадр не выглядел
+// подозрительным.
+function flagOcclusion(results) {
+  const detected = results.filter(r => r && r.detected);
+  if (detected.length < 3) return;
+  const areas = detected.map(r => r.area).sort((a, b) => a - b);
+  const strengths = detected.map(r => r.strength).sort((a, b) => a - b);
+  const medArea = areas[Math.floor(areas.length / 2)];
+  const medStrength = strengths[Math.floor(strengths.length / 2)];
+
+  for (const r of detected) {
+    const flags = r.flags.slice();
+    if (r.area < medArea * AREA_LOW_RATIO) flags.push('площадь мала');
+    if (r.area > medArea * AREA_HIGH_RATIO) flags.push('площадь велика');
+    if (r.strength < medStrength * BRIGHTNESS_LOW_RATIO) flags.push('тускло');
+    if (r.aspectRatio > ASPECT_RATIO_MAX) flags.push('вытянуто');
+    if (r.asymmetry > ASYMMETRY_MAX) flags.push('смещённый центр');
+    r.flags = flags;
+    r.suspect = flags.length > 0;
+  }
 }
 
 function drawOverlay(point) {
@@ -334,7 +453,8 @@ function drawOverlay(point) {
   ctx.clearRect(0, 0, overlayEl.width, overlayEl.height);
   if (!point || !point.detected) return;
   const { u, v } = point;
-  ctx.strokeStyle = '#ffc24b';
+
+  ctx.strokeStyle = point.suspect ? '#e4572e' : '#ffc24b';
   ctx.lineWidth = 2;
   ctx.beginPath();
   ctx.moveTo(u - 14, v); ctx.lineTo(u + 14, v);
@@ -369,9 +489,8 @@ async function runPass(passNumber) {
 
   for (let i = 0; i < n; i++) {
     await waitForLine(l => l === `ON ${i}`, 5000);
-    await new Promise(resolve => setTimeout(resolve, 600));
     const onFrame = await captureFrame();
-    const centroid = diffAndCentroid(bgFrame, onFrame);
+    const centroid = analyzeFlash(bgFrame, onFrame);
     results[i] = centroid;
     drawOverlay(centroid);
 
@@ -382,8 +501,20 @@ async function runPass(passNumber) {
   }
 
   await waitForLine(l => l === 'SCAN_DONE', 3000).catch(() => {});
-  const detectedCount = results.filter(r => r.detected).length;
-  appendLog(`— Проход ${passNumber}: готово, обнаружено ${detectedCount}/${n} —`);
+
+  // Помечаем подозрительные точки по статистике всего прохода
+  flagOcclusion(results);
+
+  const detectedCount = results.filter(r => r && r.detected).length;
+  const suspectCount  = results.filter(r => r && r.detected && r.suspect).length;
+  appendLog(`— Проход ${passNumber}: готово, обнаружено ${detectedCount}/${n}, подозрительных ${suspectCount} —`,
+            suspectCount > 0);
+  for (let i = 0; i < results.length; i++) {
+    const r = results[i];
+    if (r && r.detected && r.suspect) {
+      appendLog(`  LED ${i + 1}: ${r.flags.join(', ')}`, true);
+    }
+  }
   return results;
 }
 
@@ -408,7 +539,11 @@ function computePoints() {
     const d2 = !!(p2 && p2.detected);
 
     if (!d1 && !d2) {
-      points.push({ index: i, x: null, y: null, z: null, detected1: false, detected2: false, complete: false });
+      points.push({
+        index: i, x: null, y: null, z: null,
+        detected1: false, detected2: false, complete: false,
+        suspect: false, flags: []
+      });
       continue;
     }
 
@@ -419,7 +554,15 @@ function computePoints() {
     else if (d1) y = -(p1.v - cy1) * scale;
     else y = -(p2.v - cy2) * scale;
 
-    points.push({ index: i, x, y, z, detected1: d1, detected2: d2, complete: d1 && d2 });
+    const suspect = !!((p1 && p1.suspect) || (p2 && p2.suspect));
+    const flags = [...((p1 && p1.flags) || []), ...((p2 && p2.flags) || [])];
+
+    points.push({
+      index: i, x, y, z,
+      detected1: d1, detected2: d2,
+      complete: d1 && d2,
+      suspect, flags
+    });
   }
   state.points = points;
   return points;
@@ -482,14 +625,19 @@ function renderViewer() {
   const scale = (Math.min(w, h) * 0.35) / maxAbs;
 
   const projected = pts
-    .map(p => Object.assign(project({ x: p.x || 0, y: p.y || 0, z: p.z || 0 }, w / 2, h / 2, scale), { complete: p.complete }))
+    .map(p => Object.assign(
+      project({ x: p.x || 0, y: p.y || 0, z: p.z || 0 }, w / 2, h / 2, scale),
+      { complete: p.complete, suspect: p.suspect }
+    ))
     .sort((a, b) => a.depth - b.depth);
 
   for (const pp of projected) {
     const r = Math.max(2, 5 * pp.f);
     ctx.beginPath();
     ctx.arc(pp.sx, pp.sy, r, 0, Math.PI * 2);
-    ctx.fillStyle = pp.complete ? 'rgba(94, 234, 212, 0.9)' : 'rgba(139, 141, 152, 0.55)';
+    if (pp.suspect)       ctx.fillStyle = 'rgba(255, 194, 75, 0.9)';
+    else if (pp.complete) ctx.fillStyle = 'rgba(94, 234, 212, 0.9)';
+    else                  ctx.fillStyle = 'rgba(139, 141, 152, 0.55)';
     ctx.fill();
   }
 }
@@ -504,13 +652,44 @@ function downloadBlob(content, filename, type) {
   URL.revokeObjectURL(url);
 }
 
+function exportJSON() {
+  const data = {
+    generated: new Date().toISOString(),
+    led_count: state.points.length,
+    scale_units_per_pixel: state.scaleUnitsPerPixel,
+    invert_z: state.invertZ,
+    points: state.points
+  };
+  downloadBlob(JSON.stringify(data, null, 2), 'led_coordinates.json', 'application/json');
+}
+
+function exportCSV() {
+  const rows = ['index,x,y,z,detected_pass1,detected_pass2,suspect,flags'];
+  for (const p of state.points) {
+    rows.push([
+      p.index,
+      p.x ?? '', p.y ?? '', p.z ?? '',
+      p.detected1, p.detected2, p.suspect,
+      '"' + (p.flags || []).join('; ') + '"'
+    ].join(','));
+  }
+  downloadBlob(rows.join('\n'), 'led_coordinates.csv', 'text/csv');
+}
+
+// Экспорт в формате C-массива для вставки в прошивку Arduino.
+// digits — знаков после запятой; skipIncomplete — пропускать ли LED,
+// у которых не определены обе оси.
 function exportCArray() {
+  const digits = 2;
+  const skipIncomplete = false;
   const lines = [];
   for (const p of state.points) {
-    const x = (p.x ?? 0).toFixed(2);
-    const y = (p.y ?? 0).toFixed(2);
-    const z = (p.z ?? 0).toFixed(2);
-    lines.push(`  { ${x}f, ${y}f, ${z}f },  // LED${p.index + 1}`);
+    if (skipIncomplete && !p.complete) continue;
+    const x = (p.x ?? 0).toFixed(digits);
+    const y = (p.y ?? 0).toFixed(digits);
+    const z = (p.z ?? 0).toFixed(digits);
+    const comment = p.suspect ? `  // LED${p.index + 1} — подозрительный: ${p.flags.join(', ')}` : `  // LED${p.index + 1}`;
+    lines.push(`  { ${x}f, ${y}f, ${z}f },${comment}`);
   }
   const output = 'const float leds[][3] = {\n' + lines.join('\n') + '\n};';
   downloadBlob(output, 'led_coordinates.txt', 'text/plain');
@@ -519,6 +698,7 @@ function exportCArray() {
 // ==================== ИНТЕРФЕЙС (простая машина состояний) ====================
 function progressPct() { return state.progressTotal ? (state.progressDone / state.progressTotal * 100) : 0; }
 function countDetected(arr) { return arr.filter(r => r && r.detected).length; }
+function countSuspect(arr) { return arr.filter(r => r && r.detected && r.suspect).length; }
 
 function render() {
   switch (state.phase) {
@@ -558,6 +738,7 @@ function render() {
       controlPanel.innerHTML = `
         <h2>Проход 1 завершён</h2>
         <p class="mono">Обнаружено: ${countDetected(state.pass1)} / ${state.pass1.length}</p>
+        <p class="mono">Подозрительных (окклюзия/блик): ${countSuspect(state.pass1)}</p>
         <div class="row">
           <button data-action="redoPass1">Повторить</button>
           <button data-action="toRotate" class="primary">Далее — повернуть на 90°</button>
@@ -575,14 +756,18 @@ function render() {
 
     case 'results': {
       const complete = state.points.filter(p => p.complete).length;
+      const suspects = state.points.filter(p => p.suspect).length;
       controlPanel.innerHTML = `
         <h2>Результат</h2>
         <p class="mono">Полностью определены (обе оси): ${complete} / ${state.points.length}</p>
+        <p class="mono">Подозрительных (возможная окклюзия/блик): ${suspects}</p>
         <label class="field"><input type="checkbox" data-action="toggleInvertZ" ${state.invertZ ? 'checked' : ''}> Инвертировать ось Z (если облако выглядит зеркальным)</label>
         <label class="field">Масштаб, единиц/пиксель
           <input type="number" class="mono" data-action="setScale" value="${state.scaleUnitsPerPixel}" step="0.001" min="0.0001">
         </label>
         <div class="row">
+          <button data-action="exportJSON">Скачать JSON</button>
+          <button data-action="exportCSV">Скачать CSV</button>
           <button data-action="exportCArray">Скачать C-массив</button>
         </div>
         <div class="row">
@@ -611,6 +796,8 @@ async function handleAction(action, el) {
     case 'redoPass2': state.phase = 'rotate'; render(); break;
     case 'toggleInvertZ': state.invertZ = el.checked; computePoints(); renderViewer(); break;
     case 'setScale': state.scaleUnitsPerPixel = parseFloat(el.value) || 1; computePoints(); renderViewer(); break;
+    case 'exportJSON': exportJSON(); break;
+    case 'exportCSV': exportCSV(); break;
     case 'exportCArray': exportCArray(); break;
   }
 }
@@ -631,7 +818,7 @@ async function doScanPhase(passNum) {
       computePoints();
     }
   } catch (e) {
-    appendLog('Ошибка сканирования: ' + e.message);
+    appendLog('Ошибка сканирования: ' + e.message, true);
     state.phase = passNum === 1 ? 'pass1-ready' : 'rotate';
   }
   render();

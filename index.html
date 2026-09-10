@@ -369,6 +369,7 @@ async function runPass(passNumber) {
 
   for (let i = 0; i < n; i++) {
     await waitForLine(l => l === `ON ${i}`, 5000);
+    await new Promise(resolve => setTimeout(resolve, 200));
     const onFrame = await captureFrame();
     const centroid = diffAndCentroid(bgFrame, onFrame);
     results[i] = centroid;

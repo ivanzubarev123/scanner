@@ -496,6 +496,7 @@ async function runPass(passNumber) {
 
     await sendLine('ACK');
     await waitForLine(l => l === `OFF ${i}`, 5000);
+    await new Promise(r => setTimeout(r, 200));
     bgFrame = await captureFrame(); // кадр сразу после выключения — свежий фон для следующего светодиода
     updateProgress(i + 1, n);
   }

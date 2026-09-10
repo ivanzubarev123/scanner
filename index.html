@@ -504,23 +504,16 @@ function downloadBlob(content, filename, type) {
   URL.revokeObjectURL(url);
 }
 
-function exportJSON() {
-  const data = {
-    generated: new Date().toISOString(),
-    led_count: state.points.length,
-    scale_units_per_pixel: state.scaleUnitsPerPixel,
-    invert_z: state.invertZ,
-    points: state.points
-  };
-  downloadBlob(JSON.stringify(data, null, 2), 'led_coordinates.json', 'application/json');
-}
-
-function exportCSV() {
-  const rows = ['index,x,y,z,detected_pass1,detected_pass2'];
+function exportCArray() {
+  const lines = [];
   for (const p of state.points) {
-    rows.push([p.index, p.x ?? '', p.y ?? '', p.z ?? '', p.detected1, p.detected2].join(','));
+    const x = (p.x ?? 0).toFixed(2);
+    const y = (p.y ?? 0).toFixed(2);
+    const z = (p.z ?? 0).toFixed(2);
+    lines.push(`  { ${x}f, ${y}f, ${z}f },  // LED${p.index + 1}`);
   }
-  downloadBlob(rows.join('\n'), 'led_coordinates.csv', 'text/csv');
+  const output = 'const float leds[][3] = {\n' + lines.join('\n') + '\n};';
+  downloadBlob(output, 'led_coordinates.txt', 'text/plain');
 }
 
 // ==================== ИНТЕРФЕЙС (простая машина состояний) ====================
@@ -590,8 +583,7 @@ function render() {
           <input type="number" class="mono" data-action="setScale" value="${state.scaleUnitsPerPixel}" step="0.001" min="0.0001">
         </label>
         <div class="row">
-          <button data-action="exportJSON">Скачать JSON</button>
-          <button data-action="exportCSV">Скачать CSV</button>
+          <button data-action="exportCArray">Скачать C-массив</button>
         </div>
         <div class="row">
           <button data-action="redoPass1">Повторить проход 1</button>
@@ -619,8 +611,7 @@ async function handleAction(action, el) {
     case 'redoPass2': state.phase = 'rotate'; render(); break;
     case 'toggleInvertZ': state.invertZ = el.checked; computePoints(); renderViewer(); break;
     case 'setScale': state.scaleUnitsPerPixel = parseFloat(el.value) || 1; computePoints(); renderViewer(); break;
-    case 'exportJSON': exportJSON(); break;
-    case 'exportCSV': exportCSV(); break;
+    case 'exportCArray': exportCArray(); break;
   }
 }
 

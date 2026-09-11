@@ -72,6 +72,7 @@
   @media (prefers-reduced-motion: reduce) { .progress-bar { transition: none; } }
 
   .mono { font-family: var(--mono); font-size: 13px; }
+  .mono.warn { color: var(--red); }
 
   .field { display: block; font-size: 13px; color: var(--text-dim); margin-bottom: 14px; }
   .field input[type="number"] {
@@ -87,7 +88,7 @@
 <div class="app">
   <header>
     <h1>Сканер гирлянды: восстановление 3D-координат</h1>
-    <p>Два прохода вспышками, синхронизированных по Serial с Arduino, дают X, Y и Z каждого шарика — по индексу светодиода, без сопоставления вручную.</p>
+    <p>Четыре прохода вспышками (0°, 90°, 180°, 270°), синхронизированных по Serial с Arduino, дают X, Y и Z каждого шарика по индексу светодиода — без сопоставления вручную. Каждая ось получает независимую оценку от двух противоположных ракурсов, поэтому шар, закрытый другим шаром с одной стороны, всё равно определяется по паре с другой.</p>
     <div class="warning" id="apiWarning" hidden></div>
   </header>
   <main>
@@ -104,7 +105,7 @@
       <div class="panel">
         <h2>Облако точек</h2>
         <canvas id="viewer3d" width="440" height="380"></canvas>
-        <p class="hint" style="margin-top:10px; margin-bottom:0;">Перетаскивание вращает, колесо мыши — масштаб.</p>
+        <p class="hint" style="margin-top:10px; margin-bottom:0;">Перетаскивание вращает, колесо мыши — масштаб. Бирюзовый — уверенно определён по обеим осям, жёлтый — определён, но с низкой уверенностью (много закрытых ракурсов), серый — не хватило данных. Красная обводка — ракурсы разошлись между собой сильнее ожидаемого.</p>
       </div>
     </div>
   </main>
@@ -115,18 +116,40 @@
 
 // ==================== НАСТРОЙКИ АЛГОРИТМА ====================
 const MIN_FLASH_BRIGHTNESS = 15;   // мин. яркость разницы (0-255), чтобы считать вспышку обнаруженной
-const THRESHOLD_RATIO      = 0.5;  // доля от пикового значения для включения пикселя в центроид
+const THRESHOLD_RATIO      = 0.5;  // доля от пикового значения для грубого выделения пятна
 const MAX_BLOB_FRACTION    = 0.25; // если "пятно" больше этой доли кадра — считаем это ошибкой (засветка/движение)
 const FRAME_SKIP           = 1;    // сколько новых кадров видео пропустить после события перед захватом
+const FRAMES_TO_AVERAGE    = 3;    // сколько кадров усреднять при захвате — снижает шум матрицы и повышает точность центроида
+
+// Пороги для детекции окклюзии (шар частично или полностью закрыт другим шаром).
+// Логика описана рядом с flagOcclusions(): каждый признак сам по себе шумноват,
+// но вместе они надёжно ловят "нецелый" силуэт шара.
+const MAX_ASPECT_OK               = 1.35; // до этого соотношения сторон bbox пятно считается "круглым"
+const MAX_ASYMMETRY_OK            = 0.12; // допустимое относительное смещение взвеш. центра от центра bbox
+const OCCLUSION_SUSPICION_THRESHOLD = 1.0; // порог суммарной "тревожности" для флага occluded
+const MIN_SAMPLES_FOR_STATS       = 4;    // меньше — статистика по проходу ненадёжна, флаги не ставим
+
+// Насколько могут расходиться две независимые оценки одной оси (X от 0°/180°,
+// Z от 90°/270°), прежде чем это считается подозрительным рассогласованием.
+const INCONSISTENCY_TOLERANCE_PX = 20;
+
+// Ракурсы прохода в порядке выполнения. Индекс совпадает с state.passIndex.
+const PASS_ANGLES = [0, 90, 180, 270];
+// Единичные векторы, показывающие, какую комбинацию X/Z "видит" горизонталь
+// кадра на каждом ракурсе объекта в системе координат объекта (см. computePoints).
+const AXIS_COS = [1, 0, -1, 0];
+const AXIS_SIN = [0, 1, 0, -1];
 
 // ==================== СОСТОЯНИЕ ====================
 const state = {
   port: null, writer: null, reader: null, serialConnected: false,
   cameraStream: null, cameraConnected: false,
-  phase: 'connect', // connect -> pass1-ready -> pass1-scanning -> pass1-done -> rotate -> pass2-scanning -> results
-  pass1: [], pass2: [],
-  pass1Size: null, pass2Size: null,
+  phase: 'connect', // connect -> ready -> scanning -> done -> (ready за след. проход) -> ... -> results
+  passIndex: 0,           // 0..3 — какой из 4 проходов сейчас/следующий
+  passes: [null, null, null, null],     // сырые результаты analyzeBlob по каждому ракурсу
+  passSizes: [null, null, null, null],  // разрешение кадра на момент каждого прохода
   progressDone: 0, progressTotal: 0,
+  invertX: false,
   invertZ: false,
   scaleUnitsPerPixel: 1,
   points: []
@@ -252,7 +275,7 @@ async function connectCamera() {
     // чтобы оверлей с прицелом совпадал с картинкой без леттербоксинга
     document.querySelector('.video-wrap').style.aspectRatio = `${videoEl.videoWidth} / ${videoEl.videoHeight}`;
     resizeOverlay();
-    appendLog(`Камера подключена: ${videoEl.videoWidth}?${videoEl.videoHeight}`);
+    appendLog(`Камера подключена: ${videoEl.videoWidth}×${videoEl.videoHeight}`);
   } catch (e) {
     appendLog('Не удалось подключить камеру: ' + e.message);
   }
@@ -282,16 +305,113 @@ function grabCurrentFrame() {
   return ctx.getImageData(0, 0, w, h);
 }
 
-async function captureFrame() {
-  for (let i = 0; i < FRAME_SKIP; i++) await waitNextVideoFrame();
-  return grabCurrentFrame();
+// Усредняем несколько последовательных кадров поканально (Float32), прежде
+// чем считать яркость. Матричный шум камеры некоррелирован между кадрами,
+// а сам шарик за 2-3 кадра (~60-100мс) не сдвигается — поэтому усреднение
+// прямо снижает дисперсию центроида, не тратя времени на что-то умнее.
+function averageFrames(frames) {
+  const w = frames[0].width, h = frames[0].height;
+  const len = w * h * 4;
+  const acc = new Float32Array(len);
+  for (const f of frames) {
+    const d = f.data;
+    for (let i = 0; i < len; i++) acc[i] += d[i];
+  }
+  const n = frames.length;
+  for (let i = 0; i < len; i++) acc[i] /= n;
+  return { data: acc, width: w, height: h };
 }
 
-// ==================== ОБРАБОТКА ИЗОБРАЖЕНИЯ ====================
-// Разница яркости "вспышка минус фон" + взвешенный центроид даёт субпиксельную
-// точность локализации без необходимости в connected-component labeling —
-// этого достаточно, пока в кадре ровно одно яркое пятно.
-function diffAndCentroid(bg, flash) {
+async function captureFrame() {
+  for (let i = 0; i < FRAME_SKIP; i++) await waitNextVideoFrame();
+  const frames = [grabCurrentFrame()];
+  for (let i = 1; i < FRAMES_TO_AVERAGE; i++) {
+    await waitNextVideoFrame();
+    frames.push(grabCurrentFrame());
+  }
+  return averageFrames(frames);
+}
+
+// ==================== АНАЛИЗ ПЯТНА ВСПЫШКИ ====================
+// Дешёвый box blur 3x3 по diff-карте перед выделением пятна — сглаживает
+// шум матрицы, который иначе "дёргает" контур пятна и портит субпиксельную
+// точность. Сканирование не realtime (один вызов на светодиод), поэтому
+// простой O(w·h·9) проход не создаёт проблем с производительностью.
+function boxBlur3(src, w, h) {
+  const out = new Float32Array(w * h);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      let sum = 0, n = 0;
+      for (let dy = -1; dy <= 1; dy++) {
+        const yy = y + dy;
+        if (yy < 0 || yy >= h) continue;
+        for (let dx = -1; dx <= 1; dx++) {
+          const xx = x + dx;
+          if (xx < 0 || xx >= w) continue;
+          sum += src[yy * w + xx];
+          n++;
+        }
+      }
+      out[y * w + x] = sum / n;
+    }
+  }
+  return out;
+}
+
+// Грубая сегментация пятна по порогу: даёт форму (bbox, площадь) и первичный
+// взвешенный центроид. Форма bbox — то, что несёт сигнал об окклюзии
+// (соотношение сторон, асимметрия), поэтому её всегда считаем по фиксированному
+// порогу, а не по "мягкому" окну.
+function blobStats(diff, w, h, threshold) {
+  let sumW = 0, sumX = 0, sumY = 0, count = 0;
+  let minX = w, maxX = -1, minY = h, maxY = -1;
+  for (let y = 0; y < h; y++) {
+    const rowOff = y * w;
+    for (let x = 0; x < w; x++) {
+      const d = diff[rowOff + x];
+      if (d >= threshold) {
+        sumW += d; sumX += d * x; sumY += d * y; count++;
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+      }
+    }
+  }
+  if (count === 0) return null;
+  return { cu: sumX / sumW, cv: sumY / sumW, count, minX, maxX, minY, maxY };
+}
+
+// Уточняем центроид в круглом окне вокруг грубой оценки, по НЕпороговым
+// (полным) значениям diff. Это убирает систематическое смещение, которое
+// вносит резкий срез THRESHOLD_RATIO — окно берёт весь плавный спад яркости
+// шарика целиком, а не только пиксели выше порога, что и даёт основной
+// выигрыш в точности определения середины шара.
+function refineCentroid(diff, w, h, cx, cy, radius) {
+  const x0 = Math.max(0, Math.floor(cx - radius)), x1 = Math.min(w - 1, Math.ceil(cx + radius));
+  const y0 = Math.max(0, Math.floor(cy - radius)), y1 = Math.min(h - 1, Math.ceil(cy + radius));
+  const r2 = radius * radius;
+  let sumW = 0, sumX = 0, sumY = 0;
+  for (let y = y0; y <= y1; y++) {
+    const dy = y - cy;
+    const rowOff = y * w;
+    for (let x = x0; x <= x1; x++) {
+      const dx = x - cx;
+      if (dx * dx + dy * dy > r2) continue;
+      const d = diff[rowOff + x];
+      if (d <= 0) continue;
+      sumW += d; sumX += d * x; sumY += d * y;
+    }
+  }
+  if (sumW <= 0) return null;
+  return { cu: sumX / sumW, cv: sumY / sumW };
+}
+
+// Полный анализ одного кадра "вспышка минус фон": детекция + субпиксельный
+// центроид + метрики формы пятна, которые нужны для детекции окклюзии
+// (площадь, соотношение сторон, асимметрия, абсолютная яркость — см.
+// flagOcclusions ниже, где из них считается итоговый флаг/уверенность).
+function analyzeBlob(bg, flash) {
   const w = flash.width, h = flash.height;
   const bd = bg.data, fd = flash.data;
   const diff = new Float32Array(w * h);
@@ -301,51 +421,111 @@ function diffAndCentroid(bg, flash) {
     const lumF = 0.299 * fd[i] + 0.587 * fd[i + 1] + 0.114 * fd[i + 2];
     const lumB = 0.299 * bd[i] + 0.587 * bd[i + 1] + 0.114 * bd[i + 2];
     const d = lumF - lumB;
-    const dd = d > 0 ? d : 0;
-    diff[p] = dd;
-    if (dd > maxDiff) maxDiff = dd;
+    diff[p] = d > 0 ? d : 0;
+    if (diff[p] > maxDiff) maxDiff = diff[p];
   }
 
-  if (maxDiff < MIN_FLASH_BRIGHTNESS) {
-    return { u: null, v: null, detected: false, strength: maxDiff };
-  }
+  const empty = { detected: false, strength: maxDiff };
+  if (maxDiff < MIN_FLASH_BRIGHTNESS) return empty;
 
+  const smoothed = boxBlur3(diff, w, h);
   const threshold = maxDiff * THRESHOLD_RATIO;
-  let sumW = 0, sumX = 0, sumY = 0, count = 0;
-  for (let y = 0; y < h; y++) {
-    const rowOff = y * w;
-    for (let x = 0; x < w; x++) {
-      const d = diff[rowOff + x];
-      if (d >= threshold) {
-        sumW += d; sumX += d * x; sumY += d * y; count++;
-      }
-    }
-  }
+  const rough = blobStats(smoothed, w, h, threshold);
+  if (!rough || rough.count > w * h * MAX_BLOB_FRACTION) return empty;
 
-  if (count === 0 || count > w * h * MAX_BLOB_FRACTION) {
-    return { u: null, v: null, detected: false, strength: maxDiff };
-  }
+  const bboxW = rough.maxX - rough.minX + 1;
+  const bboxH = rough.maxY - rough.minY + 1;
 
-  return { u: sumX / sumW, v: sumY / sumW, detected: true, strength: maxDiff, pixelCount: count };
+  const windowRadius = Math.max(bboxW, bboxH) * 0.9 + 4;
+  const refined = refineCentroid(smoothed, w, h, rough.cu, rough.cv, windowRadius) || rough;
+
+  // Асимметрия: смещение взвешенного центра относительно геометрического
+  // центра bbox, нормированное на размер пятна. У целого шара оно близко к 0;
+  // у шара, частично закрытого другим шаром, светящаяся область смещена
+  // в сторону — это и есть основной прямой сигнал окклюзии.
+  const bcu = (rough.minX + rough.maxX) / 2;
+  const bcv = (rough.minY + rough.maxY) / 2;
+  const asymX = (rough.cu - bcu) / (bboxW / 2);
+  const asymY = (rough.cv - bcv) / (bboxH / 2);
+  const asymmetry = Math.sqrt(asymX * asymX + asymY * asymY);
+
+  const aspect = bboxW > bboxH ? bboxW / bboxH : bboxH / bboxW; // всегда >= 1
+
+  return {
+    detected: true,
+    u: refined.cu, v: refined.cv,
+    strength: maxDiff,
+    area: rough.count,
+    aspect, asymmetry,
+    minX: rough.minX, maxX: rough.maxX, minY: rough.minY, maxY: rough.maxY
+  };
 }
 
-function drawOverlay(point) {
+function median(arr) {
+  const s = [...arr].sort((a, b) => a - b);
+  const mid = Math.floor(s.length / 2);
+  return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
+}
+
+// Помечает подозрительные на окклюзию детекции внутри ОДНОГО прохода.
+// Площадь и яркость сравниваются с медианой по проходу (устойчиво к
+// выбросам через MAD), соотношение сторон и асимметрия — с фиксированными
+// порогами (это форма пятна, она не зависит от освещения конкретного шара).
+// Результат — булев флаг (для UI/лога) и непрерывная confidence (для
+// взвешенного объединения ракурсов в computePoints).
+function flagOcclusions(results) {
+  const valid = results.filter(r => r && r.detected);
+  if (valid.length < MIN_SAMPLES_FOR_STATS) {
+    for (const r of valid) { r.flagged = false; r.confidence = 1; }
+    return results;
+  }
+
+  const areas = valid.map(r => r.area);
+  const strengths = valid.map(r => r.strength);
+  const medArea = median(areas);
+  const medStrength = median(strengths);
+  const madArea = median(areas.map(a => Math.abs(a - medArea))) || 1;
+  const madStrength = median(strengths.map(s => Math.abs(s - medStrength))) || 1;
+
+  for (const r of valid) {
+    const areaZ = Math.abs(r.area - medArea) / (madArea * 1.4826);
+    const strengthZ = Math.abs(r.strength - medStrength) / (madStrength * 1.4826);
+    const aspectExcess = Math.max(0, r.aspect - MAX_ASPECT_OK);
+    const asymExcess = Math.max(0, r.asymmetry - MAX_ASYMMETRY_OK);
+
+    // Аддитивная эвристика по 4 независимым признакам. Форма (aspect/asymmetry)
+    // весит больше: окклюзия почти всегда сначала ломает форму пятна, тогда
+    // как площадь и яркость немного гуляют и у нормальных, неперекрытых шаров.
+    const suspicion =
+      Math.max(0, areaZ - 1.5) * 0.4 +
+      Math.max(0, strengthZ - 1.5) * 0.3 +
+      aspectExcess * 1.5 +
+      asymExcess * 1.5;
+
+    r.flagged = suspicion > OCCLUSION_SUSPICION_THRESHOLD;
+    r.confidence = 1 / (1 + suspicion);
+  }
+  return results;
+}
+
+function drawOverlay(blob) {
   const ctx = overlayEl.getContext('2d');
   ctx.clearRect(0, 0, overlayEl.width, overlayEl.height);
-  if (!point || !point.detected) return;
-  const { u, v } = point;
+  if (!blob || !blob.detected) return;
+  const { u, v, minX, maxX, minY, maxY } = blob;
   ctx.strokeStyle = '#ffc24b';
   ctx.lineWidth = 2;
   ctx.beginPath();
   ctx.moveTo(u - 14, v); ctx.lineTo(u + 14, v);
   ctx.moveTo(u, v - 14); ctx.lineTo(u, v + 14);
   ctx.stroke();
-  ctx.beginPath();
-  ctx.arc(u, v, 8, 0, Math.PI * 2);
-  ctx.stroke();
+  if (minX !== undefined) {
+    ctx.lineWidth = 1;
+    ctx.strokeRect(minX, minY, maxX - minX, maxY - minY);
+  }
 }
 
-// ==================== ОРКЕСТРАЦИЯ ПРОХОДА ====================
+// ==================== ОРКЕСТРАЦИЯ ОДНОГО ПРОХОДА ====================
 function updateProgress(done, total) {
   state.progressDone = done;
   state.progressTotal = total;
@@ -355,9 +535,12 @@ function updateProgress(done, total) {
   if (label) label.textContent = `${done} / ${total}`;
 }
 
-async function runPass(passNumber) {
+function detectedCount(results) { return (results || []).filter(r => r && r.detected).length; }
+function flaggedCount(results) { return (results || []).filter(r => r && r.flagged).length; }
+
+async function runPass(passIndex) {
   const results = [];
-  appendLog(`— Проход ${passNumber}: старт —`);
+  appendLog(`— Проход ${passIndex + 1}/4 (${PASS_ANGLES[passIndex]}°): старт —`);
 
   drawOverlay(null);
   let bgFrame = await captureFrame(); // фон при полностью погашенной гирлянде
@@ -371,9 +554,9 @@ async function runPass(passNumber) {
     await waitForLine(l => l === `ON ${i}`, 5000);
     await new Promise(resolve => setTimeout(resolve, 200));
     const onFrame = await captureFrame();
-    const centroid = diffAndCentroid(bgFrame, onFrame);
-    results[i] = centroid;
-    drawOverlay(centroid);
+    const blob = analyzeBlob(bgFrame, onFrame);
+    results[i] = blob;
+    drawOverlay(blob);
 
     await sendLine('ACK');
     await waitForLine(l => l === `OFF ${i}`, 5000);
@@ -382,44 +565,95 @@ async function runPass(passNumber) {
   }
 
   await waitForLine(l => l === 'SCAN_DONE', 3000).catch(() => {});
-  const detectedCount = results.filter(r => r.detected).length;
-  appendLog(`— Проход ${passNumber}: готово, обнаружено ${detectedCount}/${n} —`);
+
+  flagOcclusions(results);
+  const suspects = [];
+  results.forEach((r, i) => { if (r && r.flagged) suspects.push('LED' + (i + 1)); });
+
+  appendLog(`— Проход ${passIndex + 1}/4: готово, обнаружено ${detectedCount(results)}/${n}` +
+    (suspects.length ? `, под подозрением на перекрытие: ${suspects.join(', ')}` : '') + ' —');
+
   return results;
 }
 
-// ==================== ОБЪЕДИНЕНИЕ ДВУХ ПРОХОДОВ В X,Y,Z ====================
-// Проход 1 (вид спереди): горизонталь кадра > X, вертикаль > Y.
-// Проход 2 (вид сбоку, после поворота на 90°): горизонталь кадра > Z, вертикаль > Y.
-// Соответствие точек между проходами — по индексу светодиода, поэтому
-// сложная задача stereo correspondence здесь просто не возникает.
+// ==================== ОБЪЕДИНЕНИЕ 4 РАКУРСОВ В X, Y, Z ====================
+// Проход k выполняется после поворота объекта на PASS_ANGLES[k] градусов
+// относительно старта. Горизонталь кадра на этом ракурсе видит комбинацию
+// осей объекта x·cos(θ)+z·sin(θ); при θ, кратном 90°, cos/sin равны 0 или ±1,
+// поэтому AXIS_COS/AXIS_SIN просто говорят, какую из осей (X или Z) даёт
+// горизонталь конкретного прохода и с каким знаком:
+//   0°:  горизонталь =  x        90°:  горизонталь =  z
+//   180°: горизонталь = -x       270°: горизонталь = -z
+// Отсюда для X есть 2 независимые оценки (проходы 0° и 180°), и для Z тоже
+// 2 независимые оценки (90° и 270°) — если один ракурс закрыт, ось всё равно
+// определяется по второму. Y усредняется по всем ракурсам, где шар виден.
+function weightedCombine(estimates) {
+  if (estimates.length === 0) return { value: null, confidence: 0 };
+  const confident = estimates.filter(e => !e.flagged);
+  const pool = confident.length > 0 ? confident : estimates;
+  const sumW = pool.reduce((a, e) => a + e.w, 0);
+  const value = sumW > 0
+    ? pool.reduce((a, e) => a + e.w * e.v, 0) / sumW
+    : pool.reduce((a, e) => a + e.v, 0) / pool.length;
+  // Полная уверенность только если есть 2 независимых неподозрительных ракурса
+  // для этой оси; один уверенный ракурс — уверенность вполовину; все ракурсы
+  // подозрительные — низкая, но не нулевая (лучше грубая точка, чем дыра).
+  const confidence = confident.length > 0 ? Math.min(1, confident.length / 2) : 0.2;
+  return { value, confidence };
+}
+
+function checkInconsistency(estimates, tolerancePx) {
+  const confident = estimates.filter(e => !e.flagged);
+  if (confident.length < 2) return false;
+  const vals = confident.map(e => e.v);
+  return (Math.max(...vals) - Math.min(...vals)) > tolerancePx;
+}
+
 function computePoints() {
-  const n = Math.max(state.pass1.length, state.pass2.length);
-  const s1 = state.pass1Size, s2 = state.pass2Size;
-  const cx1 = s1 ? s1.w / 2 : 0, cy1 = s1 ? s1.h / 2 : 0;
-  const cx2 = s2 ? s2.w / 2 : 0, cy2 = s2 ? s2.h / 2 : 0;
-  const zSign = state.invertZ ? -1 : 1;
+  const passes = state.passes;
+  const sizes = state.passSizes;
   const scale = state.scaleUnitsPerPixel || 1;
+  const xSign = state.invertX ? -1 : 1;
+  const zSign = state.invertZ ? -1 : 1;
+  const tolerance = INCONSISTENCY_TOLERANCE_PX * scale;
+
+  const lengths = passes.filter(Boolean).map(p => p.length);
+  const n = lengths.length ? Math.max(...lengths) : 0;
 
   const points = [];
   for (let i = 0; i < n; i++) {
-    const p1 = state.pass1[i];
-    const p2 = state.pass2[i];
-    const d1 = !!(p1 && p1.detected);
-    const d2 = !!(p2 && p2.detected);
+    const xEst = [], zEst = [], yEst = [];
+    let viewsDetected = 0;
 
-    if (!d1 && !d2) {
-      points.push({ index: i, x: null, y: null, z: null, detected1: false, detected2: false, complete: false });
-      continue;
+    for (let k = 0; k < 4; k++) {
+      const size = sizes[k];
+      const p = passes[k] && passes[k][i];
+      if (!size || !p || !p.detected) continue;
+      viewsDetected++;
+
+      const uC = (p.u - size.w / 2) * scale;
+      const vC = -(p.v - size.h / 2) * scale;
+      const conf = p.flagged ? 0.15 : 1;
+      const flagged = !!p.flagged;
+
+      if (AXIS_COS[k] !== 0) xEst.push({ v: (uC / AXIS_COS[k]) * xSign, w: conf, flagged });
+      if (AXIS_SIN[k] !== 0) zEst.push({ v: (uC / AXIS_SIN[k]) * zSign, w: conf, flagged });
+      yEst.push({ v: vC, w: conf, flagged });
     }
 
-    const x = d1 ? (p1.u - cx1) * scale : null;
-    const z = d2 ? (p2.u - cx2) * scale * zSign : null;
-    let y;
-    if (d1 && d2) y = -(((p1.v - cy1) + (p2.v - cy2)) / 2) * scale;
-    else if (d1) y = -(p1.v - cy1) * scale;
-    else y = -(p2.v - cy2) * scale;
+    const x = weightedCombine(xEst);
+    const y = weightedCombine(yEst);
+    const z = weightedCombine(zEst);
 
-    points.push({ index: i, x, y, z, detected1: d1, detected2: d2, complete: d1 && d2 });
+    points.push({
+      index: i,
+      x: x.value, y: y.value, z: z.value,
+      complete: x.value !== null && y.value !== null && z.value !== null,
+      confidence: Math.min(x.confidence || 0, y.confidence || 0, z.confidence || 0),
+      viewsDetected,
+      inconsistentX: checkInconsistency(xEst, tolerance),
+      inconsistentZ: checkInconsistency(zEst, tolerance)
+    });
   }
   state.points = points;
   return points;
@@ -482,15 +716,25 @@ function renderViewer() {
   const scale = (Math.min(w, h) * 0.35) / maxAbs;
 
   const projected = pts
-    .map(p => Object.assign(project({ x: p.x || 0, y: p.y || 0, z: p.z || 0 }, w / 2, h / 2, scale), { complete: p.complete }))
+    .map(p => Object.assign(
+      project({ x: p.x || 0, y: p.y || 0, z: p.z || 0 }, w / 2, h / 2, scale),
+      { complete: p.complete, confidence: p.confidence, inconsistent: p.inconsistentX || p.inconsistentZ }
+    ))
     .sort((a, b) => a.depth - b.depth);
 
   for (const pp of projected) {
     const r = Math.max(2, 5 * pp.f);
     ctx.beginPath();
     ctx.arc(pp.sx, pp.sy, r, 0, Math.PI * 2);
-    ctx.fillStyle = pp.complete ? 'rgba(94, 234, 212, 0.9)' : 'rgba(139, 141, 152, 0.55)';
+    ctx.fillStyle = !pp.complete ? 'rgba(139, 141, 152, 0.55)'
+      : pp.confidence >= 0.7 ? 'rgba(94, 234, 212, 0.9)'
+      : 'rgba(255, 194, 75, 0.85)';
     ctx.fill();
+    if (pp.inconsistent) {
+      ctx.lineWidth = 1.5;
+      ctx.strokeStyle = 'rgba(228, 87, 46, 0.9)';
+      ctx.stroke();
+    }
   }
 }
 
@@ -510,15 +754,20 @@ function exportCArray() {
     const x = (p.x ?? 0).toFixed(2);
     const y = (p.y ?? 0).toFixed(2);
     const z = (p.z ?? 0).toFixed(2);
-    lines.push(`  { ${x}f, ${y}f, ${z}f },  // LED${p.index + 1}`);
+    const flags = [];
+    if (!p.complete) flags.push('неполные данные');
+    if (p.inconsistentX) flags.push('X: расхождение ракурсов');
+    if (p.inconsistentZ) flags.push('Z: расхождение ракурсов');
+    if (p.complete && p.confidence < 0.5) flags.push('низкая уверенность');
+    const comment = `LED${p.index + 1}` + (flags.length ? ` — ВНИМАНИЕ: ${flags.join('; ')}` : '');
+    lines.push(`  { ${x}f, ${y}f, ${z}f },  // ${comment}`);
   }
   const output = 'const float leds[][3] = {\n' + lines.join('\n') + '\n};';
   downloadBlob(output, 'led_coordinates.txt', 'text/plain');
 }
 
-// ==================== ИНТЕРФЕЙС (простая машина состояний) ====================
+// ==================== ИНТЕРФЕЙС (машина состояний по 4 проходам) ====================
 function progressPct() { return state.progressTotal ? (state.progressDone / state.progressTotal * 100) : 0; }
-function countDetected(arr) { return arr.filter(r => r && r.detected).length; }
 
 function render() {
   switch (state.phase) {
@@ -527,58 +776,63 @@ function render() {
         <h2>Шаг 1 · Подключение</h2>
         <p class="hint">Нужны оба устройства, прежде чем начать сканирование.</p>
         <div class="row">
-          <button data-action="connectSerial" ${state.serialConnected ? 'disabled' : ''}>${state.serialConnected ? '? Arduino подключен' : 'Подключить Arduino'}</button>
-          <button data-action="connectCamera" ${state.cameraConnected ? 'disabled' : ''}>${state.cameraConnected ? '? Камера подключена' : 'Подключить камеру'}</button>
+          <button data-action="connectSerial" ${state.serialConnected ? 'disabled' : ''}>${state.serialConnected ? '✓ Arduino подключен' : 'Подключить Arduino'}</button>
+          <button data-action="connectCamera" ${state.cameraConnected ? 'disabled' : ''}>${state.cameraConnected ? '✓ Камера подключена' : 'Подключить камеру'}</button>
         </div>
-        <button data-action="toPass1Ready" class="primary" ${(state.serialConnected && state.cameraConnected) ? '' : 'disabled'}>Далее</button>
+        <button data-action="toReady" class="primary" ${(state.serialConnected && state.cameraConnected) ? '' : 'disabled'}>Далее</button>
       `;
       break;
 
-    case 'pass1-ready':
-      controlPanel.innerHTML = `
-        <h2>Шаг 2 · Проход 1 — вид спереди</h2>
-        <p class="hint">Направьте камеру на стакан спереди и зафиксируйте её — во время всего прохода она не должна двигаться. Приглушите свет в комнате и уберите блестящие поверхности из кадра, это сильно повышает точность.</p>
-        <button data-action="startPass1" class="primary">Начать проход 1</button>
-      `;
-      break;
-
-    case 'pass1-scanning':
-    case 'pass2-scanning': {
-      const n = state.phase === 'pass1-scanning' ? 1 : 2;
-      controlPanel.innerHTML = `
-        <h2>Проход ${n} выполняется</h2>
-        <div class="progress"><div class="progress-bar" id="progressBar" style="width:${progressPct()}%"></div></div>
-        <p class="mono" id="progressLabel">${state.progressDone} / ${state.progressTotal}</p>
-        <p class="hint">Не двигайте камеру и стакан до конца прохода.</p>
+    case 'ready': {
+      const idx = state.passIndex;
+      controlPanel.innerHTML = idx === 0 ? `
+        <h2>Шаг 2 · Проход 1 из 4 — исходное положение (0°)</h2>
+        <p class="hint">Направьте камеру на конструкцию и зафиксируйте её — камера не должна двигаться до конца всех 4 проходов. Приглушите свет в комнате и уберите блестящие поверхности из кадра, это сильно повышает точность.</p>
+        <button data-action="startPass" class="primary">Начать проход 1</button>
+      ` : `
+        <h2>Поворот на 90° · проход ${idx + 1} из 4 (${PASS_ANGLES[idx]}° от старта)</h2>
+        <p class="hint">Поверните конструкцию ещё на 90°, камеру не трогайте. Проще и точнее поворачивать сам объект на отмеченном месте (например, на листе с прочерченным углом). Расстояние до объекта и зум камеры — как в проходе 1, иначе оси получатся в разных масштабах.</p>
+        <button data-action="startPass" class="primary">Готово, начать проход ${idx + 1}</button>
       `;
       break;
     }
 
-    case 'pass1-done':
+    case 'scanning': {
+      const idx = state.passIndex;
       controlPanel.innerHTML = `
-        <h2>Проход 1 завершён</h2>
-        <p class="mono">Обнаружено: ${countDetected(state.pass1)} / ${state.pass1.length}</p>
+        <h2>Проход ${idx + 1} из 4 выполняется</h2>
+        <div class="progress"><div class="progress-bar" id="progressBar" style="width:${progressPct()}%"></div></div>
+        <p class="mono" id="progressLabel">${state.progressDone} / ${state.progressTotal}</p>
+        <p class="hint">Не двигайте камеру и конструкцию до конца прохода.</p>
+      `;
+      break;
+    }
+
+    case 'done': {
+      const idx = state.passIndex;
+      const results = state.passes[idx] || [];
+      const isLast = idx === 3;
+      const flagged = flaggedCount(results);
+      controlPanel.innerHTML = `
+        <h2>Проход ${idx + 1} из 4 завершён</h2>
+        <p class="mono">Обнаружено: ${detectedCount(results)} / ${results.length}${flagged ? ` <span class="warn">(под подозрением на перекрытие: ${flagged})</span>` : ''}</p>
         <div class="row">
-          <button data-action="redoPass1">Повторить</button>
-          <button data-action="toRotate" class="primary">Далее — повернуть на 90°</button>
+          <button data-action="redoPass">Повторить проход</button>
+          <button data-action="nextStep" class="primary">${isLast ? 'Далее — построить облако точек' : 'Далее — повернуть на 90°'}</button>
         </div>
       `;
       break;
-
-    case 'rotate':
-      controlPanel.innerHTML = `
-        <h2>Шаг 3 · Поворот на 90°</h2>
-        <p class="hint">Теперь камера должна смотреть на стакан сбоку — перпендикулярно первому проходу. Проще и точнее повернуть сам стакан на отмеченном месте (например, на листе с прочерченным углом), оставив камеру неподвижной. Расстояние до стакана и зум камеры оставьте такими же, как в проходе 1 — так X, Y и Z получатся в одном масштабе.</p>
-        <button data-action="startPass2" class="primary">Готово, начать проход 2</button>
-      `;
-      break;
+    }
 
     case 'results': {
       const complete = state.points.filter(p => p.complete).length;
+      const inconsistent = state.points.filter(p => p.inconsistentX || p.inconsistentZ).length;
       controlPanel.innerHTML = `
         <h2>Результат</h2>
-        <p class="mono">Полностью определены (обе оси): ${complete} / ${state.points.length}</p>
-        <label class="field"><input type="checkbox" data-action="toggleInvertZ" ${state.invertZ ? 'checked' : ''}> Инвертировать ось Z (если облако выглядит зеркальным)</label>
+        <p class="mono">Полностью определены (X, Y, Z): ${complete} / ${state.points.length}</p>
+        ${inconsistent ? `<p class="mono warn">Расхождение между противоположными ракурсами: ${inconsistent} шар(ов)</p>` : ''}
+        <label class="field"><input type="checkbox" data-action="toggleInvertX" ${state.invertX ? 'checked' : ''}> Инвертировать ось X (если облако зеркально по горизонтали)</label>
+        <label class="field"><input type="checkbox" data-action="toggleInvertZ" ${state.invertZ ? 'checked' : ''}> Инвертировать ось Z (если облако зеркально по глубине)</label>
         <label class="field">Масштаб, единиц/пиксель
           <input type="number" class="mono" data-action="setScale" value="${state.scaleUnitsPerPixel}" step="0.001" min="0.0001">
         </label>
@@ -586,8 +840,10 @@ function render() {
           <button data-action="exportCArray">Скачать C-массив</button>
         </div>
         <div class="row">
-          <button data-action="redoPass1">Повторить проход 1</button>
-          <button data-action="redoPass2">Повторить проход 2</button>
+          <button data-action="redoPassAt0">Повторить проход 1 (0°)</button>
+          <button data-action="redoPassAt1">Повторить проход 2 (90°)</button>
+          <button data-action="redoPassAt2">Повторить проход 3 (180°)</button>
+          <button data-action="redoPassAt3">Повторить проход 4 (270°)</button>
         </div>
       `;
       renderViewer();
@@ -600,39 +856,43 @@ controlPanel.addEventListener('click', e => { const a = e.target.dataset.action;
 controlPanel.addEventListener('change', e => { const a = e.target.dataset.action; if (a) handleAction(a, e.target); });
 
 async function handleAction(action, el) {
+  if (action.startsWith('redoPassAt')) {
+    state.passIndex = parseInt(action.slice('redoPassAt'.length), 10);
+    state.phase = 'ready';
+    render();
+    return;
+  }
+
   switch (action) {
     case 'connectSerial': await connectSerial(); render(); break;
     case 'connectCamera': await connectCamera(); render(); break;
-    case 'toPass1Ready': state.phase = 'pass1-ready'; render(); break;
-    case 'startPass1': await doScanPhase(1); break;
-    case 'redoPass1': state.phase = 'pass1-ready'; render(); break;
-    case 'toRotate': state.phase = 'rotate'; render(); break;
-    case 'startPass2': await doScanPhase(2); break;
-    case 'redoPass2': state.phase = 'rotate'; render(); break;
+    case 'toReady': state.phase = 'ready'; state.passIndex = 0; render(); break;
+    case 'startPass': await doScanPhase(); break;
+    case 'redoPass': state.phase = 'ready'; render(); break;
+    case 'nextStep':
+      if (state.passIndex < 3) { state.passIndex++; state.phase = 'ready'; }
+      else { state.phase = 'results'; computePoints(); }
+      render();
+      break;
+    case 'toggleInvertX': state.invertX = el.checked; computePoints(); renderViewer(); break;
     case 'toggleInvertZ': state.invertZ = el.checked; computePoints(); renderViewer(); break;
     case 'setScale': state.scaleUnitsPerPixel = parseFloat(el.value) || 1; computePoints(); renderViewer(); break;
     case 'exportCArray': exportCArray(); break;
   }
 }
 
-async function doScanPhase(passNum) {
-  state.phase = passNum === 1 ? 'pass1-scanning' : 'pass2-scanning';
+async function doScanPhase() {
+  const idx = state.passIndex;
+  state.phase = 'scanning';
   render();
   try {
-    const results = await runPass(passNum);
-    if (passNum === 1) {
-      state.pass1 = results;
-      state.pass1Size = { w: videoEl.videoWidth, h: videoEl.videoHeight };
-      state.phase = 'pass1-done';
-    } else {
-      state.pass2 = results;
-      state.pass2Size = { w: videoEl.videoWidth, h: videoEl.videoHeight };
-      state.phase = 'results';
-      computePoints();
-    }
+    const results = await runPass(idx);
+    state.passes[idx] = results;
+    state.passSizes[idx] = { w: videoEl.videoWidth, h: videoEl.videoHeight };
+    state.phase = 'done';
   } catch (e) {
     appendLog('Ошибка сканирования: ' + e.message);
-    state.phase = passNum === 1 ? 'pass1-ready' : 'rotate';
+    state.phase = 'ready';
   }
   render();
 }
@@ -657,4 +917,4 @@ initViewer();
 render();
 </script>
 </body>
-</html> 
+</html>

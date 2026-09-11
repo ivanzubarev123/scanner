@@ -80,6 +80,8 @@
     background: var(--panel-alt); border: 1px solid var(--border); color: var(--text); font-family: var(--mono);
   }
   .field input[type="checkbox"] { margin-right: 6px; }
+  .field .field-label { display: flex; justify-content: space-between; margin-bottom: 6px; }
+  .field input[type="range"] { width: 100%; }
 
   #viewer3d { width: 100%; display: block; background: var(--panel-alt); border: 1px solid var(--border); touch-action: none; cursor: grab; }
 </style>
@@ -103,6 +105,22 @@
     <div>
       <div class="panel" id="controlPanel"></div>
       <div class="panel">
+        <h2>Настройки детекции</h2>
+        <p class="hint">Действуют сразу на все следующие измерения — подстраивайте по ходу дела, глядя на рамку пятна в оверлее и на счётчик "под подозрением" в логе после каждого прохода. Если для трекера фонарика пришлось поднимать минимальную яркость для чистого пятна — здесь, скорее всего, понадобится то же самое.</p>
+        <label class="field">
+          <span class="field-label">Порог сегментации <span class="mono" id="threshValLabel">70% от пика</span></span>
+          <input type="range" id="threshSlider" min="30" max="95" value="70">
+        </label>
+        <label class="field">
+          <span class="field-label">Мин. яркость вспышки <span class="mono" id="minFlashValLabel">25</span></span>
+          <input type="range" id="minFlashSlider" min="0" max="150" value="25">
+        </label>
+        <label class="field">
+          <span class="field-label">Кадров на усреднение <span class="mono" id="framesAvgValLabel">3</span></span>
+          <input type="range" id="framesAvgSlider" min="1" max="5" value="3">
+        </label>
+      </div>
+      <div class="panel">
         <h2>Облако точек</h2>
         <canvas id="viewer3d" width="440" height="380"></canvas>
         <p class="hint" style="margin-top:10px; margin-bottom:0;">Перетаскивание вращает, колесо мыши — масштаб. Бирюзовый — уверенно определён по обеим осям, жёлтый — определён, но с низкой уверенностью (много закрытых ракурсов), серый — не хватило данных. Красная обводка — ракурсы разошлись между собой сильнее ожидаемого.</p>
@@ -115,11 +133,16 @@
 'use strict';
 
 // ==================== НАСТРОЙКИ АЛГОРИТМА ====================
-const MIN_FLASH_BRIGHTNESS = 186;   // мин. яркость разницы (0-255), чтобы считать вспышку обнаруженной
-const THRESHOLD_RATIO      = 0.7;  // доля от пикового значения для грубого выделения пятна
+// Порог сегментации, минимальная яркость вспышки и число кадров на
+// усреднение живут в state (ниже) и регулируются ползунками в панели
+// "Настройки детекции" — их стоит подстраивать под конкретные камеру,
+// комнату и гирлянду, а не держать вслепую константами. Дефолты ниже
+// подняты заметно выше исходных: слишком низкий порог/минимум даёт
+// шумную, расползшуюся рамку пятна — в неё попадает шум матрицы и
+// глобальные (не локализованные на шарике) скачки яркости от
+// автоэкспозиции/автобаланса белого между кадрами "фон" и "вспышка".
 const MAX_BLOB_FRACTION    = 0.25; // если "пятно" больше этой доли кадра — считаем это ошибкой (засветка/движение)
 const FRAME_SKIP           = 1;    // сколько новых кадров видео пропустить после события перед захватом
-const FRAMES_TO_AVERAGE    = 3;    // сколько кадров усреднять при захвате — снижает шум матрицы и повышает точность центроида
 
 // Пороги для детекции окклюзии (шар частично или полностью закрыт другим шаром).
 // Логика описана рядом с flagOcclusions(): каждый признак сам по себе шумноват,
@@ -152,7 +175,10 @@ const state = {
   invertX: false,
   invertZ: false,
   scaleUnitsPerPixel: 1,
-  points: []
+  points: [],
+  thresholdRatio: 0.7,      // доля от пикового diff для грубого выделения пятна — крутится слайдером
+  minFlashBrightness: 25,   // мин. яркость diff (0-255), чтобы считать вспышку обнаруженной — крутится слайдером
+  framesToAverage: 3        // кадров на усреднение при захвате — крутится слайдером
 };
 
 // ==================== DOM ====================
@@ -276,8 +302,35 @@ async function connectCamera() {
     document.querySelector('.video-wrap').style.aspectRatio = `${videoEl.videoWidth} / ${videoEl.videoHeight}`;
     resizeOverlay();
     appendLog(`Камера подключена: ${videoEl.videoWidth}×${videoEl.videoHeight}`);
+    await lockExposure(stream.getVideoTracks()[0]);
   } catch (e) {
     appendLog('Не удалось подключить камеру: ' + e.message);
+  }
+}
+
+// Автоэкспозиция и автобаланс белого камеры подстраиваются под новую
+// яркость сцены при каждой вспышке — это создаёт глобальный, не
+// локализованный на самом шарике сдвиг яркости между кадрами "фон" и
+// "вспышка" и является частой причиной рваной или завышенной рамки пятна.
+// Если браузер и камера поддерживают ручной режим — фиксируем его сразу
+// после подключения. Поддержка на практике частичная (в основном Chrome на
+// десктопе с некоторыми UVC-камерами), поэтому это best-effort: не
+// получилось — просто продолжаем с автоэкспозицией, ничего не ломая.
+async function lockExposure(track) {
+  if (!track || !track.getCapabilities) return;
+  try {
+    const caps = track.getCapabilities();
+    const advanced = {};
+    if (caps.exposureMode && caps.exposureMode.includes('manual')) advanced.exposureMode = 'manual';
+    if (caps.whiteBalanceMode && caps.whiteBalanceMode.includes('manual')) advanced.whiteBalanceMode = 'manual';
+    if (Object.keys(advanced).length === 0) {
+      appendLog('Камера не поддерживает ручную экспозицию/баланс белого — оставляю авто.');
+      return;
+    }
+    await track.applyConstraints({ advanced: [advanced] });
+    appendLog('Экспозиция/баланс белого зафиксированы вручную — меньше засветки между кадрами.');
+  } catch (e) {
+    appendLog('Не удалось зафиксировать экспозицию: ' + e.message);
   }
 }
 
@@ -322,14 +375,27 @@ function averageFrames(frames) {
   return { data: acc, width: w, height: h };
 }
 
-async function captureFrame() {
+async function grabQuickFrame() {
   for (let i = 0; i < FRAME_SKIP; i++) await waitNextVideoFrame();
-  const frames = [grabCurrentFrame()];
-  for (let i = 1; i < FRAMES_TO_AVERAGE; i++) {
+  return grabCurrentFrame();
+}
+
+// Добавляет к уже захваченному кадру ещё (framesToAverage - 1) кадров и
+// усредняет все вместе. Вынесено отдельно от grabQuickFrame(), чтобы в
+// runPass можно было сразу нарисовать примерную позицию по одному кадру —
+// не дожидаясь усреднения — и лишь потом уточнить её итоговым, более
+// чистым измерением (см. комментарий в runPass).
+async function continueAveraging(firstFrame) {
+  const frames = [firstFrame];
+  for (let i = 1; i < state.framesToAverage; i++) {
     await waitNextVideoFrame();
     frames.push(grabCurrentFrame());
   }
-  return averageFrames(frames);
+  return frames.length > 1 ? averageFrames(frames) : frames[0];
+}
+
+async function grabAveragedFrame() {
+  return continueAveraging(await grabQuickFrame());
 }
 
 // ==================== АНАЛИЗ ПЯТНА ВСПЫШКИ ====================
@@ -384,7 +450,7 @@ function blobStats(diff, w, h, threshold) {
 
 // Уточняем центроид в круглом окне вокруг грубой оценки, по НЕпороговым
 // (полным) значениям diff. Это убирает систематическое смещение, которое
-// вносит резкий срез THRESHOLD_RATIO — окно берёт весь плавный спад яркости
+// вносит резкий срез по порогу сегментации — окно берёт весь плавный спад яркости
 // шарика целиком, а не только пиксели выше порога, что и даёт основной
 // выигрыш в точности определения середины шара.
 function refineCentroid(diff, w, h, cx, cy, radius) {
@@ -426,10 +492,10 @@ function analyzeBlob(bg, flash) {
   }
 
   const empty = { detected: false, strength: maxDiff };
-  if (maxDiff < MIN_FLASH_BRIGHTNESS) return empty;
+  if (maxDiff < state.minFlashBrightness) return empty;
 
   const smoothed = boxBlur3(diff, w, h);
-  const threshold = maxDiff * THRESHOLD_RATIO;
+  const threshold = maxDiff * state.thresholdRatio;
   const rough = blobStats(smoothed, w, h, threshold);
   if (!rough || rough.count > w * h * MAX_BLOB_FRACTION) return empty;
 
@@ -543,7 +609,7 @@ async function runPass(passIndex) {
   appendLog(`— Проход ${passIndex + 1}/4 (${PASS_ANGLES[passIndex]}°): старт —`);
 
   drawOverlay(null);
-  let bgFrame = await captureFrame(); // фон при полностью погашенной гирлянде
+  let bgFrame = await grabAveragedFrame(); // фон при полностью погашенной гирлянде
 
   await sendLine('START');
   const startLine = await waitForLine(l => l.startsWith('SCAN_START'), 5000);
@@ -553,14 +619,26 @@ async function runPass(passIndex) {
   for (let i = 0; i < n; i++) {
     await waitForLine(l => l === `ON ${i}`, 5000);
     await new Promise(resolve => setTimeout(resolve, 200));
-    const onFrame = await captureFrame();
+
+    // Быстрая прикидка по одному кадру — рисуем её немедленно, пока шарик
+    // точно ещё горит. Раньше здесь ничего не рисовалось до конца усреднения
+    // (несколько кадров подряд), и точка на экране визуально появлялась
+    // как раз к моменту отправки ACK — то есть почти одновременно с тем,
+    // как прошивка гасит светодиод. Само измерение при этом всегда снималось
+    // во время свечения, просто отображалось с запозданием.
+    const quickFrame = await grabQuickFrame();
+    drawOverlay(analyzeBlob(bgFrame, quickFrame));
+
+    // Довыполняем усреднение для итогового, более чистого измерения —
+    // именно оно попадает в results[] и используется дальше.
+    const onFrame = await continueAveraging(quickFrame);
     const blob = analyzeBlob(bgFrame, onFrame);
     results[i] = blob;
     drawOverlay(blob);
 
     await sendLine('ACK');
     await waitForLine(l => l === `OFF ${i}`, 5000);
-    bgFrame = await captureFrame(); // кадр сразу после выключения — свежий фон для следующего светодиода
+    bgFrame = await grabAveragedFrame(); // кадр сразу после выключения — свежий фон для следующего светодиода
     updateProgress(i + 1, n);
   }
 
@@ -896,6 +974,27 @@ async function doScanPhase() {
   }
   render();
 }
+
+// ==================== СЛАЙДЕРЫ НАСТРОЕК ДЕТЕКЦИИ ====================
+const threshSlider = document.getElementById('threshSlider');
+const minFlashSlider = document.getElementById('minFlashSlider');
+const framesAvgSlider = document.getElementById('framesAvgSlider');
+const threshValLabel = document.getElementById('threshValLabel');
+const minFlashValLabel = document.getElementById('minFlashValLabel');
+const framesAvgValLabel = document.getElementById('framesAvgValLabel');
+
+threshSlider.addEventListener('input', () => {
+  state.thresholdRatio = Number(threshSlider.value) / 100;
+  threshValLabel.textContent = `${threshSlider.value}% от пика`;
+});
+minFlashSlider.addEventListener('input', () => {
+  state.minFlashBrightness = Number(minFlashSlider.value);
+  minFlashValLabel.textContent = minFlashSlider.value;
+});
+framesAvgSlider.addEventListener('input', () => {
+  state.framesToAverage = Number(framesAvgSlider.value);
+  framesAvgValLabel.textContent = framesAvgSlider.value;
+});
 
 // ==================== ИНИЦИАЛИЗАЦИЯ ====================
 function checkAPIs() {

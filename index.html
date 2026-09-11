@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Трекер яркого пятна в реальном времени</title>
+<title>Сканер гирлянды — 3D-координаты</title>
 <style>
   :root {
     --bg: #12141c;
@@ -44,18 +44,18 @@
   video { width: 100%; height: 100%; object-fit: contain; display: block; }
   #overlay { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
 
-  .readout {
-    margin-top: 10px; display: flex; flex-wrap: wrap; gap: 4px 18px;
+  .log {
+    margin-top: 14px; height: 160px; overflow-y: auto;
     border: 1px solid var(--border); background: var(--panel);
-    padding: 10px 14px; font-size: 12px; color: var(--text-dim);
+    padding: 10px 12px; font-family: var(--mono); font-size: 12px; color: var(--text-dim);
   }
-  .readout b { color: var(--text); font-weight: 600; }
+  .log div { padding: 1px 0; }
 
   .panel { border: 1px solid var(--border); background: var(--panel); padding: 20px; margin-bottom: 20px; }
   .panel h2 { font-size: 15px; font-weight: 600; margin: 0 0 10px; }
   .panel .hint { color: var(--text-dim); font-size: 13px; margin: 0 0 16px; max-width: 60ch; }
 
-  .row { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 10px; }
 
   button {
     font-family: var(--sans); font-size: 13px; padding: 9px 16px;
@@ -67,23 +67,28 @@
   button.primary:hover:not(:disabled) { filter: brightness(1.08); }
   button:focus-visible { outline: 2px solid var(--teal); outline-offset: 2px; }
 
-  .field { display: block; font-size: 13px; color: var(--text-dim); margin-bottom: 16px; }
-  .field .field-label { display: flex; justify-content: space-between; margin-bottom: 6px; }
-  .field input[type="range"] { width: 100%; }
-  .field select {
-    display: block; margin-top: 6px; width: 100%; padding: 7px 10px;
-    background: var(--panel-alt); border: 1px solid var(--border); color: var(--text); font-family: var(--sans);
-  }
-  .field.checkbox { display: flex; align-items: center; gap: 8px; }
+  .progress { height: 6px; background: var(--panel-alt); border: 1px solid var(--border); margin-bottom: 8px; overflow: hidden; }
+  .progress-bar { height: 100%; background: var(--amber); width: 0%; transition: width 0.15s linear; }
+  @media (prefers-reduced-motion: reduce) { .progress-bar { transition: none; } }
 
-  #pointerCanvas { width: 100%; display: block; background: #000; border: 1px solid var(--border); }
+  .mono { font-family: var(--mono); font-size: 13px; }
+  .mono.warn { color: var(--red); }
+
+  .field { display: block; font-size: 13px; color: var(--text-dim); margin-bottom: 14px; }
+  .field input[type="number"] {
+    display: block; margin-top: 6px; width: 100%; padding: 7px 10px;
+    background: var(--panel-alt); border: 1px solid var(--border); color: var(--text); font-family: var(--mono);
+  }
+  .field input[type="checkbox"] { margin-right: 6px; }
+
+  #viewer3d { width: 100%; display: block; background: var(--panel-alt); border: 1px solid var(--border); touch-action: none; cursor: grab; }
 </style>
 </head>
 <body>
 <div class="app">
   <header>
-    <h1>Трекер самого яркого пятна — в реальном времени</h1>
-    <p>Наведите камеру на фонарик (или любой яркий источник) — программа на каждом кадре находит центр самого яркого пятна и ведёт за ним точку. Центроид считается тем же способом, что и в offline-сканере гирлянды: грубая сегментация по порогу, затем уточнение центра в окне по полным (непороговым) значениям яркости — это даёт устойчивый, не дёргающийся субпиксельный результат.</p>
+    <h1>Сканер гирлянды: восстановление 3D-координат</h1>
+    <p>Четыре прохода вспышками (0°, 90°, 180°, 270°), синхронизированных по Serial с Arduino, дают X, Y и Z каждого шарика по индексу светодиода — без сопоставления вручную. Каждая ось получает независимую оценку от двух противоположных ракурсов, поэтому шар, закрытый другим шаром с одной стороны, всё равно определяется по паре с другой.</p>
     <div class="warning" id="apiWarning" hidden></div>
   </header>
   <main>
@@ -92,48 +97,15 @@
         <video id="video" autoplay playsinline muted></video>
         <canvas id="overlay"></canvas>
       </div>
-      <div class="readout mono" id="readout">камера выключена</div>
+      <canvas id="captureCanvas" hidden></canvas>
+      <div class="log" id="log"></div>
     </div>
     <div>
+      <div class="panel" id="controlPanel"></div>
       <div class="panel">
-        <h2>Управление</h2>
-        <div class="row">
-          <button id="btnStart" class="primary">Включить камеру</button>
-          <button id="btnSwitch" disabled>Сменить камеру</button>
-        </div>
-
-        <label class="field">
-          <span class="field-label">Порог сегментации <span class="mono" id="thresholdVal">60% от пика</span></span>
-          <input type="range" id="thresholdSlider" min="30" max="95" value="60">
-        </label>
-
-        <label class="field">
-          <span class="field-label">Мин. абсолютная яркость <span class="mono" id="minBrightVal">40 / 255</span></span>
-          <input type="range" id="minBrightSlider" min="0" max="255" value="40">
-        </label>
-
-        <label class="field">
-          <span class="field-label">Сглаживание точки <span class="mono" id="smoothVal">0.50</span></span>
-          <input type="range" id="smoothSlider" min="0" max="95" value="50">
-        </label>
-
-        <label class="field">
-          Разрешение анализа
-          <select id="resSelect">
-            <option value="low">Низкое — максимальный FPS</option>
-            <option value="medium" selected>Среднее</option>
-            <option value="high">Высокое — точнее, медленнее</option>
-          </select>
-        </label>
-
-        <label class="field checkbox">
-          <input type="checkbox" id="debugCheck" checked> Показывать рамку пятна и сырую (несглаженную) точку
-        </label>
-      </div>
-      <div class="panel">
-        <h2>Указатель</h2>
-        <canvas id="pointerCanvas" width="440" height="320"></canvas>
-        <p class="hint" style="margin-top:10px; margin-bottom:0;">Та же точка, отдельно от видео — с затухающим следом движения.</p>
+        <h2>Облако точек</h2>
+        <canvas id="viewer3d" width="440" height="380"></canvas>
+        <p class="hint" style="margin-top:10px; margin-bottom:0;">Перетаскивание вращает, колесо мыши — масштаб. Бирюзовый — уверенно определён по обеим осям, жёлтый — определён, но с низкой уверенностью (много закрытых ракурсов), серый — не хватило данных. Красная обводка — ракурсы разошлись между собой сильнее ожидаемого.</p>
       </div>
     </div>
   </main>
@@ -142,91 +114,263 @@
 <script>
 'use strict';
 
-// ==================== НАСТРОЙКИ АНАЛИЗА ====================
-// Кадр анализируется не в полном разрешении камеры, а на уменьшенной копии,
-// нарисованной на отдельном canvas — это на порядок быстрее полного разбора
-// кадра пиксель за пикселем и позволяет держать честный real-time (25-30
-// кадров/с) прямо в браузере. Субпиксельная точность при этом не теряется:
-// финальный центроид всё равно уточняется в окне по непрерывным яркостным
-// значениям (refineCentroid), а не по номеру ближайшего пикселя.
-const ANALYSIS_WIDTH = { low: 120, medium: 200, high: 320 };
+// ==================== НАСТРОЙКИ АЛГОРИТМА ====================
+const MIN_FLASH_BRIGHTNESS = 15;   // мин. яркость разницы (0-255), чтобы считать вспышку обнаруженной
+const THRESHOLD_RATIO      = 0.5;  // доля от пикового значения для грубого выделения пятна
+const MAX_BLOB_FRACTION    = 0.25; // если "пятно" больше этой доли кадра — считаем это ошибкой (засветка/движение)
+const FRAME_SKIP           = 1;    // сколько новых кадров видео пропустить после события перед захватом
+const FRAMES_TO_AVERAGE    = 3;    // сколько кадров усреднять при захвате — снижает шум матрицы и повышает точность центроида
 
-const MAX_MISSED_FRAMES = 8; // столько кадров подряд без детекции ждём, прежде чем "потерять" точку
+// Пороги для детекции окклюзии (шар частично или полностью закрыт другим шаром).
+// Логика описана рядом с flagOcclusions(): каждый признак сам по себе шумноват,
+// но вместе они надёжно ловят "нецелый" силуэт шара.
+const MAX_ASPECT_OK               = 1.35; // до этого соотношения сторон bbox пятно считается "круглым"
+const MAX_ASYMMETRY_OK            = 0.12; // допустимое относительное смещение взвеш. центра от центра bbox
+const OCCLUSION_SUSPICION_THRESHOLD = 1.0; // порог суммарной "тревожности" для флага occluded
+const MIN_SAMPLES_FOR_STATS       = 4;    // меньше — статистика по проходу ненадёжна, флаги не ставим
+
+// Насколько могут расходиться две независимые оценки одной оси (X от 0°/180°,
+// Z от 90°/270°), прежде чем это считается подозрительным рассогласованием.
+const INCONSISTENCY_TOLERANCE_PX = 20;
+
+// Ракурсы прохода в порядке выполнения. Индекс совпадает с state.passIndex.
+const PASS_ANGLES = [0, 90, 180, 270];
+// Единичные векторы, показывающие, какую комбинацию X/Z "видит" горизонталь
+// кадра на каждом ракурсе объекта в системе координат объекта (см. computePoints).
+const AXIS_COS = [1, 0, -1, 0];
+const AXIS_SIN = [0, 1, 0, -1];
 
 // ==================== СОСТОЯНИЕ ====================
 const state = {
-  stream: null,
-  running: false,
-  facingMode: 'environment',
-  thresholdRatio: 0.6,
-  minBrightness: 40,
-  smoothing: 0.5,
-  analysisPreset: 'medium',
-  showDebug: true,
-  smoothedPos: null,   // {u, v} в нормированных 0..1 координатах кадра, либо null — точка ещё не найдена
-  rawPos: null,
-  missedFrames: 0,
-  lastFrameTime: performance.now(),
-  fps: 0
+  port: null, writer: null, reader: null, serialConnected: false,
+  cameraStream: null, cameraConnected: false,
+  phase: 'connect', // connect -> ready -> scanning -> done -> (ready за след. проход) -> ... -> results
+  passIndex: 0,           // 0..3 — какой из 4 проходов сейчас/следующий
+  passes: [null, null, null, null],     // сырые результаты analyzeBlob по каждому ракурсу
+  passSizes: [null, null, null, null],  // разрешение кадра на момент каждого прохода
+  progressDone: 0, progressTotal: 0,
+  invertX: false,
+  invertZ: false,
+  scaleUnitsPerPixel: 1,
+  points: []
 };
 
 // ==================== DOM ====================
 const videoEl = document.getElementById('video');
 const overlayEl = document.getElementById('overlay');
-const readoutEl = document.getElementById('readout');
+const captureCanvas = document.getElementById('captureCanvas');
+const controlPanel = document.getElementById('controlPanel');
+const logEl = document.getElementById('log');
+const viewerCanvas = document.getElementById('viewer3d');
 const apiWarning = document.getElementById('apiWarning');
-const pointerCanvas = document.getElementById('pointerCanvas');
-const pointerCtx = pointerCanvas.getContext('2d');
 
-const btnStart = document.getElementById('btnStart');
-const btnSwitch = document.getElementById('btnSwitch');
-const thresholdSlider = document.getElementById('thresholdSlider');
-const minBrightSlider = document.getElementById('minBrightSlider');
-const smoothSlider = document.getElementById('smoothSlider');
-const resSelect = document.getElementById('resSelect');
-const debugCheck = document.getElementById('debugCheck');
+function appendLog(msg) {
+  const time = new Date().toLocaleTimeString('ru-RU', { hour12: false });
+  const line = document.createElement('div');
+  line.textContent = `[${time}] ${msg}`;
+  logEl.appendChild(line);
+  logEl.scrollTop = logEl.scrollHeight;
+}
 
-const thresholdVal = document.getElementById('thresholdVal');
-const minBrightVal = document.getElementById('minBrightVal');
-const smoothVal = document.getElementById('smoothVal');
+// ==================== SERIAL: очередь строк, устойчивая к гонкам ====================
+// Строка, пришедшая до того, как её кто-то ждёт, не теряется — она попадает в
+// очередь, и waitForLine сначала проверяет очередь, потом уже подписывается.
+const lineQueue = [];
+const lineListeners = new Set();
 
-// Отдельный (не показанный в DOM) canvas — на него рисуется уменьшенная
-// копия кадра для анализа.
-const analysisCanvas = document.createElement('canvas');
-const analysisCtx = analysisCanvas.getContext('2d', { willReadFrequently: true });
-
-// ==================== АЛГОРИТМ: ПОИСК ЦЕНТРА САМОГО ЯРКОГО ПЯТНА ====================
-// Тот же приём, что и в offline-сканере гирлянды, только без сравнения с
-// отдельным "фоновым" кадром — здесь ищем не разницу вспышки, а просто
-// самое яркое связное пятно текущего кадра. Шаг 1: грубая сегментация по
-// порогу (доля от пиковой яркости кадра ИЛИ абсолютный минимум — что выше),
-// это даёт bbox пятна. Шаг 2: уточнение центра в окне вокруг грубой оценки
-// по полным (непороговым) значениям яркости — убирает систематическое
-// смещение центра, которое вносит резкий порог, и даёт куда менее дёрганный
-// результат от кадра к кадру.
-function analyzeFrame(imageData, thresholdRatio, minBrightness) {
-  const w = imageData.width, h = imageData.height;
-  const data = imageData.data;
-  const lum = new Float32Array(w * h);
-  let maxLum = 0;
-
-  for (let p = 0, i = 0; p < lum.length; p++, i += 4) {
-    const l = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
-    lum[p] = l;
-    if (l > maxLum) maxLum = l;
+function dispatchLine(line) {
+  appendLog('« ' + line);
+  let consumed = false;
+  for (const cb of lineListeners) {
+    if (cb(line)) { consumed = true; break; }
   }
-  if (maxLum < minBrightness) return null;
+  if (!consumed) {
+    lineQueue.push(line);
+    if (lineQueue.length > 50) lineQueue.shift();
+  }
+}
 
-  const threshold = Math.max(minBrightness, maxLum * thresholdRatio);
+function waitForLine(predicate, timeoutMs = 5000) {
+  for (let i = 0; i < lineQueue.length; i++) {
+    if (predicate(lineQueue[i])) {
+      return Promise.resolve(lineQueue.splice(i, 1)[0]);
+    }
+  }
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      lineListeners.delete(listener);
+      reject(new Error('таймаут ожидания ответа от Arduino'));
+    }, timeoutMs);
+    const listener = (line) => {
+      if (!predicate(line)) return false;
+      clearTimeout(timer);
+      lineListeners.delete(listener);
+      resolve(line);
+      return true;
+    };
+    lineListeners.add(listener);
+  });
+}
+
+async function connectSerial() {
+  try {
+    const port = await navigator.serial.requestPort();
+    await port.open({ baudRate: 115200 });
+    state.port = port;
+    state.writer = port.writable.getWriter();
+    state.serialConnected = true;
+    appendLog('Arduino подключён по Serial');
+    readSerialLoop();
+  } catch (e) {
+    appendLog('Не удалось подключить Arduino: ' + e.message);
+  }
+}
+
+async function sendLine(text) {
+  if (!state.writer) return;
+  await state.writer.write(new TextEncoder().encode(text + '\n'));
+}
+
+async function readSerialLoop() {
+  let buffer = '';
+  const decoder = new TextDecoder();
+  try {
+    while (state.port && state.port.readable) {
+      const reader = state.port.readable.getReader();
+      state.reader = reader;
+      try {
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          let idx;
+          while ((idx = buffer.indexOf('\n')) >= 0) {
+            const line = buffer.slice(0, idx).trim();
+            buffer = buffer.slice(idx + 1);
+            if (line) dispatchLine(line);
+          }
+        }
+      } finally {
+        reader.releaseLock();
+      }
+    }
+  } catch (e) {
+    appendLog('Serial отключён: ' + e.message);
+    state.serialConnected = false;
+  }
+}
+
+// ==================== КАМЕРА ====================
+async function connectCamera() {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: { ideal: 1280 }, height: { ideal: 720 } },
+      audio: false
+    });
+    state.cameraStream = stream;
+    videoEl.srcObject = stream;
+    await videoEl.play();
+    state.cameraConnected = true;
+    // подгоняем контейнер под реальное соотношение сторон камеры,
+    // чтобы оверлей с прицелом совпадал с картинкой без леттербоксинга
+    document.querySelector('.video-wrap').style.aspectRatio = `${videoEl.videoWidth} / ${videoEl.videoHeight}`;
+    resizeOverlay();
+    appendLog(`Камера подключена: ${videoEl.videoWidth}×${videoEl.videoHeight}`);
+  } catch (e) {
+    appendLog('Не удалось подключить камеру: ' + e.message);
+  }
+}
+
+function resizeOverlay() {
+  overlayEl.width = videoEl.videoWidth;
+  overlayEl.height = videoEl.videoHeight;
+}
+
+function waitNextVideoFrame() {
+  return new Promise(resolve => {
+    if (videoEl.requestVideoFrameCallback) {
+      videoEl.requestVideoFrameCallback(() => resolve());
+    } else {
+      requestAnimationFrame(() => resolve());
+    }
+  });
+}
+
+function grabCurrentFrame() {
+  const w = videoEl.videoWidth, h = videoEl.videoHeight;
+  captureCanvas.width = w;
+  captureCanvas.height = h;
+  const ctx = captureCanvas.getContext('2d', { willReadFrequently: true });
+  ctx.drawImage(videoEl, 0, 0, w, h);
+  return ctx.getImageData(0, 0, w, h);
+}
+
+// Усредняем несколько последовательных кадров поканально (Float32), прежде
+// чем считать яркость. Матричный шум камеры некоррелирован между кадрами,
+// а сам шарик за 2-3 кадра (~60-100мс) не сдвигается — поэтому усреднение
+// прямо снижает дисперсию центроида, не тратя времени на что-то умнее.
+function averageFrames(frames) {
+  const w = frames[0].width, h = frames[0].height;
+  const len = w * h * 4;
+  const acc = new Float32Array(len);
+  for (const f of frames) {
+    const d = f.data;
+    for (let i = 0; i < len; i++) acc[i] += d[i];
+  }
+  const n = frames.length;
+  for (let i = 0; i < len; i++) acc[i] /= n;
+  return { data: acc, width: w, height: h };
+}
+
+async function captureFrame() {
+  for (let i = 0; i < FRAME_SKIP; i++) await waitNextVideoFrame();
+  const frames = [grabCurrentFrame()];
+  for (let i = 1; i < FRAMES_TO_AVERAGE; i++) {
+    await waitNextVideoFrame();
+    frames.push(grabCurrentFrame());
+  }
+  return averageFrames(frames);
+}
+
+// ==================== АНАЛИЗ ПЯТНА ВСПЫШКИ ====================
+// Дешёвый box blur 3x3 по diff-карте перед выделением пятна — сглаживает
+// шум матрицы, который иначе "дёргает" контур пятна и портит субпиксельную
+// точность. Сканирование не realtime (один вызов на светодиод), поэтому
+// простой O(w·h·9) проход не создаёт проблем с производительностью.
+function boxBlur3(src, w, h) {
+  const out = new Float32Array(w * h);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      let sum = 0, n = 0;
+      for (let dy = -1; dy <= 1; dy++) {
+        const yy = y + dy;
+        if (yy < 0 || yy >= h) continue;
+        for (let dx = -1; dx <= 1; dx++) {
+          const xx = x + dx;
+          if (xx < 0 || xx >= w) continue;
+          sum += src[yy * w + xx];
+          n++;
+        }
+      }
+      out[y * w + x] = sum / n;
+    }
+  }
+  return out;
+}
+
+// Грубая сегментация пятна по порогу: даёт форму (bbox, площадь) и первичный
+// взвешенный центроид. Форма bbox — то, что несёт сигнал об окклюзии
+// (соотношение сторон, асимметрия), поэтому её всегда считаем по фиксированному
+// порогу, а не по "мягкому" окну.
+function blobStats(diff, w, h, threshold) {
   let sumW = 0, sumX = 0, sumY = 0, count = 0;
   let minX = w, maxX = -1, minY = h, maxY = -1;
-
   for (let y = 0; y < h; y++) {
-    const row = y * w;
+    const rowOff = y * w;
     for (let x = 0; x < w; x++) {
-      const l = lum[row + x];
-      if (l >= threshold) {
-        sumW += l; sumX += l * x; sumY += l * y; count++;
+      const d = diff[rowOff + x];
+      if (d >= threshold) {
+        sumW += d; sumX += d * x; sumY += d * y; count++;
         if (x < minX) minX = x;
         if (x > maxX) maxX = x;
         if (y < minY) minY = y;
@@ -235,237 +379,542 @@ function analyzeFrame(imageData, thresholdRatio, minBrightness) {
     }
   }
   if (count === 0) return null;
-
-  const cu = sumX / sumW, cv = sumY / sumW;
-  const bboxW = maxX - minX + 1, bboxH = maxY - minY + 1;
-
-  const radius = Math.max(bboxW, bboxH) * 0.9 + 2;
-  const refined = refineCentroid(lum, w, h, cu, cv, radius) || { cu, cv };
-
-  // Координаты нормируются в 0..1 — не привязаны к разрешению анализа,
-  // поэтому переключение пресета не сбивает масштаб точки на видео.
-  return {
-    u: refined.cu / w, v: refined.cv / h,
-    strength: maxLum,
-    bboxU0: minX / w, bboxV0: minY / h, bboxU1: (maxX + 1) / w, bboxV1: (maxY + 1) / h
-  };
+  return { cu: sumX / sumW, cv: sumY / sumW, count, minX, maxX, minY, maxY };
 }
 
-function refineCentroid(lum, w, h, cx, cy, radius) {
+// Уточняем центроид в круглом окне вокруг грубой оценки, по НЕпороговым
+// (полным) значениям diff. Это убирает систематическое смещение, которое
+// вносит резкий срез THRESHOLD_RATIO — окно берёт весь плавный спад яркости
+// шарика целиком, а не только пиксели выше порога, что и даёт основной
+// выигрыш в точности определения середины шара.
+function refineCentroid(diff, w, h, cx, cy, radius) {
   const x0 = Math.max(0, Math.floor(cx - radius)), x1 = Math.min(w - 1, Math.ceil(cx + radius));
   const y0 = Math.max(0, Math.floor(cy - radius)), y1 = Math.min(h - 1, Math.ceil(cy + radius));
   const r2 = radius * radius;
   let sumW = 0, sumX = 0, sumY = 0;
   for (let y = y0; y <= y1; y++) {
     const dy = y - cy;
-    const row = y * w;
+    const rowOff = y * w;
     for (let x = x0; x <= x1; x++) {
       const dx = x - cx;
       if (dx * dx + dy * dy > r2) continue;
-      const l = lum[row + x];
-      if (l <= 0) continue;
-      sumW += l; sumX += l * x; sumY += l * y;
+      const d = diff[rowOff + x];
+      if (d <= 0) continue;
+      sumW += d; sumX += d * x; sumY += d * y;
     }
   }
   if (sumW <= 0) return null;
   return { cu: sumX / sumW, cv: sumY / sumW };
 }
 
-// ==================== КАМЕРА ====================
-async function startCamera() {
-  try {
-    if (state.stream) state.stream.getTracks().forEach(t => t.stop());
-    const stream = await navigator.mediaDevices.getUserMedia({
-      video: { facingMode: { ideal: state.facingMode }, width: { ideal: 1280 }, height: { ideal: 720 } },
-      audio: false
-    });
-    state.stream = stream;
-    videoEl.srcObject = stream;
-    await videoEl.play();
-    document.querySelector('.video-wrap').style.aspectRatio = `${videoEl.videoWidth} / ${videoEl.videoHeight}`;
-    overlayEl.width = videoEl.videoWidth;
-    overlayEl.height = videoEl.videoHeight;
-    state.running = true;
-    btnStart.textContent = 'Выключить камеру';
-    btnSwitch.disabled = false;
-    readoutEl.textContent = 'поиск пятна…';
-    state.lastFrameTime = performance.now();
-    scheduleNextFrame();
-  } catch (e) {
-    readoutEl.textContent = 'ошибка камеры: ' + e.message;
-  }
-}
+// Полный анализ одного кадра "вспышка минус фон": детекция + субпиксельный
+// центроид + метрики формы пятна, которые нужны для детекции окклюзии
+// (площадь, соотношение сторон, асимметрия, абсолютная яркость — см.
+// flagOcclusions ниже, где из них считается итоговый флаг/уверенность).
+function analyzeBlob(bg, flash) {
+  const w = flash.width, h = flash.height;
+  const bd = bg.data, fd = flash.data;
+  const diff = new Float32Array(w * h);
+  let maxDiff = 0;
 
-function stopCamera() {
-  state.running = false;
-  if (state.stream) state.stream.getTracks().forEach(t => t.stop());
-  state.stream = null;
-  btnStart.textContent = 'Включить камеру';
-  btnSwitch.disabled = true;
-  readoutEl.textContent = 'камера выключена';
-  clearOverlay();
-  drawPointer(null);
-}
-
-async function switchCamera() {
-  state.facingMode = state.facingMode === 'environment' ? 'user' : 'environment';
-  if (state.running) await startCamera();
-}
-
-// ==================== ЦИКЛ ОБРАБОТКИ КАДРОВ ====================
-function scheduleNextFrame() {
-  if (videoEl.requestVideoFrameCallback) {
-    videoEl.requestVideoFrameCallback(processFrame);
-  } else {
-    requestAnimationFrame(processFrame);
-  }
-}
-
-function processFrame() {
-  if (!state.running) return;
-
-  const vw = videoEl.videoWidth, vh = videoEl.videoHeight;
-  if (vw && vh) {
-    const aw = ANALYSIS_WIDTH[state.analysisPreset];
-    const ah = Math.max(1, Math.round(aw * vh / vw));
-    if (analysisCanvas.width !== aw || analysisCanvas.height !== ah) {
-      analysisCanvas.width = aw;
-      analysisCanvas.height = ah;
-    }
-    analysisCtx.drawImage(videoEl, 0, 0, aw, ah);
-    const imageData = analysisCtx.getImageData(0, 0, aw, ah);
-    const blob = analyzeFrame(imageData, state.thresholdRatio, state.minBrightness);
-
-    if (blob) {
-      state.missedFrames = 0;
-      state.rawPos = { u: blob.u, v: blob.v };
-      if (!state.smoothedPos) {
-        state.smoothedPos = { u: blob.u, v: blob.v };
-      } else {
-        const a = 1 - state.smoothing; // доля нового значения при экспоненциальном сглаживании
-        state.smoothedPos.u += (blob.u - state.smoothedPos.u) * a;
-        state.smoothedPos.v += (blob.v - state.smoothedPos.v) * a;
-      }
-      drawOverlay(blob);
-      updateReadout(blob, true);
-    } else {
-      state.missedFrames++;
-      if (state.missedFrames > MAX_MISSED_FRAMES) {
-        state.smoothedPos = null;
-        state.rawPos = null;
-        clearOverlay();
-        updateReadout(null, false);
-      }
-    }
-    drawPointer(state.smoothedPos);
+  for (let p = 0, i = 0; p < diff.length; p++, i += 4) {
+    const lumF = 0.299 * fd[i] + 0.587 * fd[i + 1] + 0.114 * fd[i + 2];
+    const lumB = 0.299 * bd[i] + 0.587 * bd[i + 1] + 0.114 * bd[i + 2];
+    const d = lumF - lumB;
+    diff[p] = d > 0 ? d : 0;
+    if (diff[p] > maxDiff) maxDiff = diff[p];
   }
 
-  const now = performance.now();
-  state.fps = 1000 / Math.max(1, now - state.lastFrameTime);
-  state.lastFrameTime = now;
+  const empty = { detected: false, strength: maxDiff };
+  if (maxDiff < MIN_FLASH_BRIGHTNESS) return empty;
 
-  scheduleNextFrame();
+  const smoothed = boxBlur3(diff, w, h);
+  const threshold = maxDiff * THRESHOLD_RATIO;
+  const rough = blobStats(smoothed, w, h, threshold);
+  if (!rough || rough.count > w * h * MAX_BLOB_FRACTION) return empty;
+
+  const bboxW = rough.maxX - rough.minX + 1;
+  const bboxH = rough.maxY - rough.minY + 1;
+
+  const windowRadius = Math.max(bboxW, bboxH) * 0.9 + 4;
+  const refined = refineCentroid(smoothed, w, h, rough.cu, rough.cv, windowRadius) || rough;
+
+  // Асимметрия: смещение взвешенного центра относительно геометрического
+  // центра bbox, нормированное на размер пятна. У целого шара оно близко к 0;
+  // у шара, частично закрытого другим шаром, светящаяся область смещена
+  // в сторону — это и есть основной прямой сигнал окклюзии.
+  const bcu = (rough.minX + rough.maxX) / 2;
+  const bcv = (rough.minY + rough.maxY) / 2;
+  const asymX = (rough.cu - bcu) / (bboxW / 2);
+  const asymY = (rough.cv - bcv) / (bboxH / 2);
+  const asymmetry = Math.sqrt(asymX * asymX + asymY * asymY);
+
+  const aspect = bboxW > bboxH ? bboxW / bboxH : bboxH / bboxW; // всегда >= 1
+
+  return {
+    detected: true,
+    u: refined.cu, v: refined.cv,
+    strength: maxDiff,
+    area: rough.count,
+    aspect, asymmetry,
+    minX: rough.minX, maxX: rough.maxX, minY: rough.minY, maxY: rough.maxY
+  };
 }
 
-// ==================== ОТРИСОВКА ====================
-function clearOverlay() {
-  overlayEl.getContext('2d').clearRect(0, 0, overlayEl.width, overlayEl.height);
+function median(arr) {
+  const s = [...arr].sort((a, b) => a - b);
+  const mid = Math.floor(s.length / 2);
+  return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
+}
+
+// Помечает подозрительные на окклюзию детекции внутри ОДНОГО прохода.
+// Площадь и яркость сравниваются с медианой по проходу (устойчиво к
+// выбросам через MAD), соотношение сторон и асимметрия — с фиксированными
+// порогами (это форма пятна, она не зависит от освещения конкретного шара).
+// Результат — булев флаг (для UI/лога) и непрерывная confidence (для
+// взвешенного объединения ракурсов в computePoints).
+function flagOcclusions(results) {
+  const valid = results.filter(r => r && r.detected);
+  if (valid.length < MIN_SAMPLES_FOR_STATS) {
+    for (const r of valid) { r.flagged = false; r.confidence = 1; }
+    return results;
+  }
+
+  const areas = valid.map(r => r.area);
+  const strengths = valid.map(r => r.strength);
+  const medArea = median(areas);
+  const medStrength = median(strengths);
+  const madArea = median(areas.map(a => Math.abs(a - medArea))) || 1;
+  const madStrength = median(strengths.map(s => Math.abs(s - medStrength))) || 1;
+
+  for (const r of valid) {
+    const areaZ = Math.abs(r.area - medArea) / (madArea * 1.4826);
+    const strengthZ = Math.abs(r.strength - medStrength) / (madStrength * 1.4826);
+    const aspectExcess = Math.max(0, r.aspect - MAX_ASPECT_OK);
+    const asymExcess = Math.max(0, r.asymmetry - MAX_ASYMMETRY_OK);
+
+    // Аддитивная эвристика по 4 независимым признакам. Форма (aspect/asymmetry)
+    // весит больше: окклюзия почти всегда сначала ломает форму пятна, тогда
+    // как площадь и яркость немного гуляют и у нормальных, неперекрытых шаров.
+    const suspicion =
+      Math.max(0, areaZ - 1.5) * 0.4 +
+      Math.max(0, strengthZ - 1.5) * 0.3 +
+      aspectExcess * 1.5 +
+      asymExcess * 1.5;
+
+    r.flagged = suspicion > OCCLUSION_SUSPICION_THRESHOLD;
+    r.confidence = 1 / (1 + suspicion);
+  }
+  return results;
 }
 
 function drawOverlay(blob) {
   const ctx = overlayEl.getContext('2d');
   ctx.clearRect(0, 0, overlayEl.width, overlayEl.height);
-  const w = overlayEl.width, h = overlayEl.height;
-  const u = blob.u * w, v = blob.v * h;
-
-  if (state.showDebug) {
-    ctx.strokeStyle = 'rgba(94, 234, 212, 0.7)';
+  if (!blob || !blob.detected) return;
+  const { u, v, minX, maxX, minY, maxY } = blob;
+  ctx.strokeStyle = '#ffc24b';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(u - 14, v); ctx.lineTo(u + 14, v);
+  ctx.moveTo(u, v - 14); ctx.lineTo(u, v + 14);
+  ctx.stroke();
+  if (minX !== undefined) {
     ctx.lineWidth = 1;
-    ctx.strokeRect(blob.bboxU0 * w, blob.bboxV0 * h, (blob.bboxU1 - blob.bboxU0) * w, (blob.bboxV1 - blob.bboxV0) * h);
-    // сырая (несглаженная) точка — тусклая, чтобы отличалась от основного указателя
-    ctx.fillStyle = 'rgba(94, 234, 212, 0.8)';
-    ctx.beginPath(); ctx.arc(u, v, 3, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeRect(minX, minY, maxX - minX, maxY - minY);
+  }
+}
+
+// ==================== ОРКЕСТРАЦИЯ ОДНОГО ПРОХОДА ====================
+function updateProgress(done, total) {
+  state.progressDone = done;
+  state.progressTotal = total;
+  const bar = document.getElementById('progressBar');
+  const label = document.getElementById('progressLabel');
+  if (bar) bar.style.width = (total ? (done / total * 100) : 0) + '%';
+  if (label) label.textContent = `${done} / ${total}`;
+}
+
+function detectedCount(results) { return (results || []).filter(r => r && r.detected).length; }
+function flaggedCount(results) { return (results || []).filter(r => r && r.flagged).length; }
+
+async function runPass(passIndex) {
+  const results = [];
+  appendLog(`— Проход ${passIndex + 1}/4 (${PASS_ANGLES[passIndex]}°): старт —`);
+
+  drawOverlay(null);
+  let bgFrame = await captureFrame(); // фон при полностью погашенной гирлянде
+
+  await sendLine('START');
+  const startLine = await waitForLine(l => l.startsWith('SCAN_START'), 5000);
+  const n = parseInt(startLine.split(' ')[1], 10);
+  updateProgress(0, n);
+
+  for (let i = 0; i < n; i++) {
+    await waitForLine(l => l === `ON ${i}`, 5000);
+    await new Promise(resolve => setTimeout(resolve, 200));
+    const onFrame = await captureFrame();
+    const blob = analyzeBlob(bgFrame, onFrame);
+    results[i] = blob;
+    drawOverlay(blob);
+
+    await sendLine('ACK');
+    await waitForLine(l => l === `OFF ${i}`, 5000);
+    bgFrame = await captureFrame(); // кадр сразу после выключения — свежий фон для следующего светодиода
+    updateProgress(i + 1, n);
   }
 
-  if (state.smoothedPos) {
-    const su = state.smoothedPos.u * w, sv = state.smoothedPos.v * h;
-    ctx.strokeStyle = '#ffc24b';
-    ctx.lineWidth = 2;
+  await waitForLine(l => l === 'SCAN_DONE', 3000).catch(() => {});
+
+  flagOcclusions(results);
+  const suspects = [];
+  results.forEach((r, i) => { if (r && r.flagged) suspects.push('LED' + (i + 1)); });
+
+  appendLog(`— Проход ${passIndex + 1}/4: готово, обнаружено ${detectedCount(results)}/${n}` +
+    (suspects.length ? `, под подозрением на перекрытие: ${suspects.join(', ')}` : '') + ' —');
+
+  return results;
+}
+
+// ==================== ОБЪЕДИНЕНИЕ 4 РАКУРСОВ В X, Y, Z ====================
+// Проход k выполняется после поворота объекта на PASS_ANGLES[k] градусов
+// относительно старта. Горизонталь кадра на этом ракурсе видит комбинацию
+// осей объекта x·cos(θ)+z·sin(θ); при θ, кратном 90°, cos/sin равны 0 или ±1,
+// поэтому AXIS_COS/AXIS_SIN просто говорят, какую из осей (X или Z) даёт
+// горизонталь конкретного прохода и с каким знаком:
+//   0°:  горизонталь =  x        90°:  горизонталь =  z
+//   180°: горизонталь = -x       270°: горизонталь = -z
+// Отсюда для X есть 2 независимые оценки (проходы 0° и 180°), и для Z тоже
+// 2 независимые оценки (90° и 270°) — если один ракурс закрыт, ось всё равно
+// определяется по второму. Y усредняется по всем ракурсам, где шар виден.
+function weightedCombine(estimates) {
+  if (estimates.length === 0) return { value: null, confidence: 0 };
+  const confident = estimates.filter(e => !e.flagged);
+  const pool = confident.length > 0 ? confident : estimates;
+  const sumW = pool.reduce((a, e) => a + e.w, 0);
+  const value = sumW > 0
+    ? pool.reduce((a, e) => a + e.w * e.v, 0) / sumW
+    : pool.reduce((a, e) => a + e.v, 0) / pool.length;
+  // Полная уверенность только если есть 2 независимых неподозрительных ракурса
+  // для этой оси; один уверенный ракурс — уверенность вполовину; все ракурсы
+  // подозрительные — низкая, но не нулевая (лучше грубая точка, чем дыра).
+  const confidence = confident.length > 0 ? Math.min(1, confident.length / 2) : 0.2;
+  return { value, confidence };
+}
+
+function checkInconsistency(estimates, tolerancePx) {
+  const confident = estimates.filter(e => !e.flagged);
+  if (confident.length < 2) return false;
+  const vals = confident.map(e => e.v);
+  return (Math.max(...vals) - Math.min(...vals)) > tolerancePx;
+}
+
+function computePoints() {
+  const passes = state.passes;
+  const sizes = state.passSizes;
+  const scale = state.scaleUnitsPerPixel || 1;
+  const xSign = state.invertX ? -1 : 1;
+  const zSign = state.invertZ ? -1 : 1;
+  const tolerance = INCONSISTENCY_TOLERANCE_PX * scale;
+
+  const lengths = passes.filter(Boolean).map(p => p.length);
+  const n = lengths.length ? Math.max(...lengths) : 0;
+
+  const points = [];
+  for (let i = 0; i < n; i++) {
+    const xEst = [], zEst = [], yEst = [];
+    let viewsDetected = 0;
+
+    for (let k = 0; k < 4; k++) {
+      const size = sizes[k];
+      const p = passes[k] && passes[k][i];
+      if (!size || !p || !p.detected) continue;
+      viewsDetected++;
+
+      const uC = (p.u - size.w / 2) * scale;
+      const vC = -(p.v - size.h / 2) * scale;
+      const conf = p.flagged ? 0.15 : 1;
+      const flagged = !!p.flagged;
+
+      if (AXIS_COS[k] !== 0) xEst.push({ v: (uC / AXIS_COS[k]) * xSign, w: conf, flagged });
+      if (AXIS_SIN[k] !== 0) zEst.push({ v: (uC / AXIS_SIN[k]) * zSign, w: conf, flagged });
+      yEst.push({ v: vC, w: conf, flagged });
+    }
+
+    const x = weightedCombine(xEst);
+    const y = weightedCombine(yEst);
+    const z = weightedCombine(zEst);
+
+    points.push({
+      index: i,
+      x: x.value, y: y.value, z: z.value,
+      complete: x.value !== null && y.value !== null && z.value !== null,
+      confidence: Math.min(x.confidence || 0, y.confidence || 0, z.confidence || 0),
+      viewsDetected,
+      inconsistentX: checkInconsistency(xEst, tolerance),
+      inconsistentZ: checkInconsistency(zEst, tolerance)
+    });
+  }
+  state.points = points;
+  return points;
+}
+
+// ==================== 3D-ПРОСМОТРЩИК (canvas 2D, свой прожектор) ====================
+const viewer = { yaw: 0.6, pitch: -0.3, zoom: 1, dragging: false, lastX: 0, lastY: 0 };
+
+function initViewer() {
+  viewerCanvas.addEventListener('mousedown', e => { viewer.dragging = true; viewer.lastX = e.clientX; viewer.lastY = e.clientY; });
+  window.addEventListener('mouseup', () => viewer.dragging = false);
+  window.addEventListener('mousemove', e => {
+    if (!viewer.dragging) return;
+    viewer.yaw += (e.clientX - viewer.lastX) * 0.01;
+    viewer.pitch = Math.max(-1.5, Math.min(1.5, viewer.pitch + (e.clientY - viewer.lastY) * 0.01));
+    viewer.lastX = e.clientX; viewer.lastY = e.clientY;
+    renderViewer();
+  });
+  viewerCanvas.addEventListener('wheel', e => {
+    e.preventDefault();
+    viewer.zoom = Math.max(0.2, Math.min(5, viewer.zoom * (e.deltaY < 0 ? 1.08 : 0.93)));
+    renderViewer();
+  }, { passive: false });
+
+  let touchLast = null;
+  viewerCanvas.addEventListener('touchstart', e => { touchLast = e.touches[0]; }, { passive: true });
+  viewerCanvas.addEventListener('touchmove', e => {
+    if (!touchLast) return;
+    const t = e.touches[0];
+    viewer.yaw += (t.clientX - touchLast.clientX) * 0.01;
+    viewer.pitch = Math.max(-1.5, Math.min(1.5, viewer.pitch + (t.clientY - touchLast.clientY) * 0.01));
+    touchLast = t;
+    renderViewer();
+  }, { passive: true });
+  viewerCanvas.addEventListener('touchend', () => touchLast = null);
+}
+
+function project(p, cx, cy, scale) {
+  const cosY = Math.cos(viewer.yaw), sinY = Math.sin(viewer.yaw);
+  const cosP = Math.cos(viewer.pitch), sinP = Math.sin(viewer.pitch);
+  let x = p.x * cosY - p.z * sinY;
+  let z = p.x * sinY + p.z * cosY;
+  const y = p.y * cosP - z * sinP;
+  z = p.y * sinP + z * cosP;
+  const camDist = 600;
+  const f = camDist / (camDist + z);
+  return { sx: cx + x * scale * f * viewer.zoom, sy: cy - y * scale * f * viewer.zoom, depth: z, f };
+}
+
+function renderViewer() {
+  const ctx = viewerCanvas.getContext('2d');
+  const w = viewerCanvas.width, h = viewerCanvas.height;
+  ctx.clearRect(0, 0, w, h);
+
+  const pts = state.points.filter(p => p.x !== null || p.z !== null);
+  if (pts.length === 0) return;
+
+  let maxAbs = 1;
+  for (const p of pts) maxAbs = Math.max(maxAbs, Math.abs(p.x || 0), Math.abs(p.y || 0), Math.abs(p.z || 0));
+  const scale = (Math.min(w, h) * 0.35) / maxAbs;
+
+  const projected = pts
+    .map(p => Object.assign(
+      project({ x: p.x || 0, y: p.y || 0, z: p.z || 0 }, w / 2, h / 2, scale),
+      { complete: p.complete, confidence: p.confidence, inconsistent: p.inconsistentX || p.inconsistentZ }
+    ))
+    .sort((a, b) => a.depth - b.depth);
+
+  for (const pp of projected) {
+    const r = Math.max(2, 5 * pp.f);
     ctx.beginPath();
-    ctx.moveTo(su - 16, sv); ctx.lineTo(su + 16, sv);
-    ctx.moveTo(su, sv - 16); ctx.lineTo(su, sv + 16);
-    ctx.stroke();
-    ctx.beginPath(); ctx.arc(su, sv, 9, 0, Math.PI * 2); ctx.stroke();
+    ctx.arc(pp.sx, pp.sy, r, 0, Math.PI * 2);
+    ctx.fillStyle = !pp.complete ? 'rgba(139, 141, 152, 0.55)'
+      : pp.confidence >= 0.7 ? 'rgba(94, 234, 212, 0.9)'
+      : 'rgba(255, 194, 75, 0.85)';
+    ctx.fill();
+    if (pp.inconsistent) {
+      ctx.lineWidth = 1.5;
+      ctx.strokeStyle = 'rgba(228, 87, 46, 0.9)';
+      ctx.stroke();
+    }
   }
 }
 
-function drawPointer(pos) {
-  const w = pointerCanvas.width, h = pointerCanvas.height;
-  // Полупрозрачная заливка поверх предыдущего кадра вместо полной очистки —
-  // получается затухающий след движения, наглядно показывающий, как точка
-  // едет за фонариком.
-  pointerCtx.fillStyle = 'rgba(0, 0, 0, 0.18)';
-  pointerCtx.fillRect(0, 0, w, h);
-  if (!pos) return;
-  const x = pos.u * w, y = pos.v * h;
-  const gradient = pointerCtx.createRadialGradient(x, y, 0, x, y, 16);
-  gradient.addColorStop(0, 'rgba(255, 194, 75, 0.95)');
-  gradient.addColorStop(1, 'rgba(255, 194, 75, 0)');
-  pointerCtx.fillStyle = gradient;
-  pointerCtx.beginPath(); pointerCtx.arc(x, y, 16, 0, Math.PI * 2); pointerCtx.fill();
-  pointerCtx.fillStyle = '#ffc24b';
-  pointerCtx.beginPath(); pointerCtx.arc(x, y, 4, 0, Math.PI * 2); pointerCtx.fill();
+// ==================== ЭКСПОРТ ====================
+function downloadBlob(content, filename, type) {
+  const blob = new Blob([content], { type });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  URL.revokeObjectURL(url);
 }
 
-function updateReadout(blob, found) {
-  if (!found || !state.smoothedPos) {
-    readoutEl.innerHTML = `<span>${blob ? 'сглаживание…' : 'пятно не найдено'}</span><span>FPS: <b>${state.fps.toFixed(0)}</b></span>`;
+function exportCArray() {
+  const lines = [];
+  for (const p of state.points) {
+    const x = (p.x ?? 0).toFixed(2);
+    const y = (p.y ?? 0).toFixed(2);
+    const z = (p.z ?? 0).toFixed(2);
+    const flags = [];
+    if (!p.complete) flags.push('неполные данные');
+    if (p.inconsistentX) flags.push('X: расхождение ракурсов');
+    if (p.inconsistentZ) flags.push('Z: расхождение ракурсов');
+    if (p.complete && p.confidence < 0.5) flags.push('низкая уверенность');
+    const comment = `LED${p.index + 1}` + (flags.length ? ` — ВНИМАНИЕ: ${flags.join('; ')}` : '');
+    lines.push(`  { ${x}f, ${y}f, ${z}f },  // ${comment}`);
+  }
+  const output = 'const float leds[][3] = {\n' + lines.join('\n') + '\n};';
+  downloadBlob(output, 'led_coordinates.txt', 'text/plain');
+}
+
+// ==================== ИНТЕРФЕЙС (машина состояний по 4 проходам) ====================
+function progressPct() { return state.progressTotal ? (state.progressDone / state.progressTotal * 100) : 0; }
+
+function render() {
+  switch (state.phase) {
+    case 'connect':
+      controlPanel.innerHTML = `
+        <h2>Шаг 1 · Подключение</h2>
+        <p class="hint">Нужны оба устройства, прежде чем начать сканирование.</p>
+        <div class="row">
+          <button data-action="connectSerial" ${state.serialConnected ? 'disabled' : ''}>${state.serialConnected ? '✓ Arduino подключен' : 'Подключить Arduino'}</button>
+          <button data-action="connectCamera" ${state.cameraConnected ? 'disabled' : ''}>${state.cameraConnected ? '✓ Камера подключена' : 'Подключить камеру'}</button>
+        </div>
+        <button data-action="toReady" class="primary" ${(state.serialConnected && state.cameraConnected) ? '' : 'disabled'}>Далее</button>
+      `;
+      break;
+
+    case 'ready': {
+      const idx = state.passIndex;
+      controlPanel.innerHTML = idx === 0 ? `
+        <h2>Шаг 2 · Проход 1 из 4 — исходное положение (0°)</h2>
+        <p class="hint">Направьте камеру на конструкцию и зафиксируйте её — камера не должна двигаться до конца всех 4 проходов. Приглушите свет в комнате и уберите блестящие поверхности из кадра, это сильно повышает точность.</p>
+        <button data-action="startPass" class="primary">Начать проход 1</button>
+      ` : `
+        <h2>Поворот на 90° · проход ${idx + 1} из 4 (${PASS_ANGLES[idx]}° от старта)</h2>
+        <p class="hint">Поверните конструкцию ещё на 90°, камеру не трогайте. Проще и точнее поворачивать сам объект на отмеченном месте (например, на листе с прочерченным углом). Расстояние до объекта и зум камеры — как в проходе 1, иначе оси получатся в разных масштабах.</p>
+        <button data-action="startPass" class="primary">Готово, начать проход ${idx + 1}</button>
+      `;
+      break;
+    }
+
+    case 'scanning': {
+      const idx = state.passIndex;
+      controlPanel.innerHTML = `
+        <h2>Проход ${idx + 1} из 4 выполняется</h2>
+        <div class="progress"><div class="progress-bar" id="progressBar" style="width:${progressPct()}%"></div></div>
+        <p class="mono" id="progressLabel">${state.progressDone} / ${state.progressTotal}</p>
+        <p class="hint">Не двигайте камеру и конструкцию до конца прохода.</p>
+      `;
+      break;
+    }
+
+    case 'done': {
+      const idx = state.passIndex;
+      const results = state.passes[idx] || [];
+      const isLast = idx === 3;
+      const flagged = flaggedCount(results);
+      controlPanel.innerHTML = `
+        <h2>Проход ${idx + 1} из 4 завершён</h2>
+        <p class="mono">Обнаружено: ${detectedCount(results)} / ${results.length}${flagged ? ` <span class="warn">(под подозрением на перекрытие: ${flagged})</span>` : ''}</p>
+        <div class="row">
+          <button data-action="redoPass">Повторить проход</button>
+          <button data-action="nextStep" class="primary">${isLast ? 'Далее — построить облако точек' : 'Далее — повернуть на 90°'}</button>
+        </div>
+      `;
+      break;
+    }
+
+    case 'results': {
+      const complete = state.points.filter(p => p.complete).length;
+      const inconsistent = state.points.filter(p => p.inconsistentX || p.inconsistentZ).length;
+      controlPanel.innerHTML = `
+        <h2>Результат</h2>
+        <p class="mono">Полностью определены (X, Y, Z): ${complete} / ${state.points.length}</p>
+        ${inconsistent ? `<p class="mono warn">Расхождение между противоположными ракурсами: ${inconsistent} шар(ов)</p>` : ''}
+        <label class="field"><input type="checkbox" data-action="toggleInvertX" ${state.invertX ? 'checked' : ''}> Инвертировать ось X (если облако зеркально по горизонтали)</label>
+        <label class="field"><input type="checkbox" data-action="toggleInvertZ" ${state.invertZ ? 'checked' : ''}> Инвертировать ось Z (если облако зеркально по глубине)</label>
+        <label class="field">Масштаб, единиц/пиксель
+          <input type="number" class="mono" data-action="setScale" value="${state.scaleUnitsPerPixel}" step="0.001" min="0.0001">
+        </label>
+        <div class="row">
+          <button data-action="exportCArray">Скачать C-массив</button>
+        </div>
+        <div class="row">
+          <button data-action="redoPassAt0">Повторить проход 1 (0°)</button>
+          <button data-action="redoPassAt1">Повторить проход 2 (90°)</button>
+          <button data-action="redoPassAt2">Повторить проход 3 (180°)</button>
+          <button data-action="redoPassAt3">Повторить проход 4 (270°)</button>
+        </div>
+      `;
+      renderViewer();
+      break;
+    }
+  }
+}
+
+controlPanel.addEventListener('click', e => { const a = e.target.dataset.action; if (a) handleAction(a, e.target); });
+controlPanel.addEventListener('change', e => { const a = e.target.dataset.action; if (a) handleAction(a, e.target); });
+
+async function handleAction(action, el) {
+  if (action.startsWith('redoPassAt')) {
+    state.passIndex = parseInt(action.slice('redoPassAt'.length), 10);
+    state.phase = 'ready';
+    render();
     return;
   }
-  const w = videoEl.videoWidth, h = videoEl.videoHeight;
-  const px = Math.round(state.smoothedPos.u * w), py = Math.round(state.smoothedPos.v * h);
-  readoutEl.innerHTML = `
-    <span>x: <b>${(state.smoothedPos.u * 100).toFixed(1)}%</b> (${px}px)</span>
-    <span>y: <b>${(state.smoothedPos.v * 100).toFixed(1)}%</b> (${py}px)</span>
-    <span>яркость пика: <b>${Math.round(blob.strength)}</b> / 255</span>
-    <span>FPS: <b>${state.fps.toFixed(0)}</b></span>
-  `;
+
+  switch (action) {
+    case 'connectSerial': await connectSerial(); render(); break;
+    case 'connectCamera': await connectCamera(); render(); break;
+    case 'toReady': state.phase = 'ready'; state.passIndex = 0; render(); break;
+    case 'startPass': await doScanPhase(); break;
+    case 'redoPass': state.phase = 'ready'; render(); break;
+    case 'nextStep':
+      if (state.passIndex < 3) { state.passIndex++; state.phase = 'ready'; }
+      else { state.phase = 'results'; computePoints(); }
+      render();
+      break;
+    case 'toggleInvertX': state.invertX = el.checked; computePoints(); renderViewer(); break;
+    case 'toggleInvertZ': state.invertZ = el.checked; computePoints(); renderViewer(); break;
+    case 'setScale': state.scaleUnitsPerPixel = parseFloat(el.value) || 1; computePoints(); renderViewer(); break;
+    case 'exportCArray': exportCArray(); break;
+  }
 }
 
-// ==================== ПРИВЯЗКА КОНТРОЛОВ ====================
-btnStart.addEventListener('click', () => { state.running ? stopCamera() : startCamera(); });
-btnSwitch.addEventListener('click', switchCamera);
-
-thresholdSlider.addEventListener('input', () => {
-  state.thresholdRatio = Number(thresholdSlider.value) / 100;
-  thresholdVal.textContent = `${thresholdSlider.value}% от пика`;
-});
-minBrightSlider.addEventListener('input', () => {
-  state.minBrightness = Number(minBrightSlider.value);
-  minBrightVal.textContent = `${minBrightSlider.value} / 255`;
-});
-smoothSlider.addEventListener('input', () => {
-  state.smoothing = Number(smoothSlider.value) / 100;
-  smoothVal.textContent = state.smoothing.toFixed(2);
-});
-resSelect.addEventListener('change', () => { state.analysisPreset = resSelect.value; });
-debugCheck.addEventListener('change', () => { state.showDebug = debugCheck.checked; });
+async function doScanPhase() {
+  const idx = state.passIndex;
+  state.phase = 'scanning';
+  render();
+  try {
+    const results = await runPass(idx);
+    state.passes[idx] = results;
+    state.passSizes[idx] = { w: videoEl.videoWidth, h: videoEl.videoHeight };
+    state.phase = 'done';
+  } catch (e) {
+    appendLog('Ошибка сканирования: ' + e.message);
+    state.phase = 'ready';
+  }
+  render();
+}
 
 // ==================== ИНИЦИАЛИЗАЦИЯ ====================
 function checkAPIs() {
-  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+  const missing = [];
+  if (!('serial' in navigator)) missing.push('Web Serial API');
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) missing.push('доступ к камере');
+  if (missing.length) {
     apiWarning.hidden = false;
-    apiWarning.textContent = 'Браузер не поддерживает доступ к камере (getUserMedia). Откройте страницу в Chrome, Edge или Safari через https:// или localhost.';
-    btnStart.disabled = true;
+    apiWarning.textContent = `Браузер не поддерживает: ${missing.join(', ')}. Откройте эту страницу в Chrome или Edge через http://localhost.`;
   }
 }
 
 window.addEventListener('beforeunload', () => {
-  if (state.stream) state.stream.getTracks().forEach(t => t.stop());
+  if (state.cameraStream) state.cameraStream.getTracks().forEach(t => t.stop());
 });
 
 checkAPIs();
-drawPointer(null);
+initViewer();
+render();
 </script>
 </body>
 </html>

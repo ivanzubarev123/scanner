@@ -252,7 +252,7 @@ async function connectCamera() {
     // чтобы оверлей с прицелом совпадал с картинкой без леттербоксинга
     document.querySelector('.video-wrap').style.aspectRatio = `${videoEl.videoWidth} / ${videoEl.videoHeight}`;
     resizeOverlay();
-    appendLog(`Камера подключена: ${videoEl.videoWidth}×${videoEl.videoHeight}`);
+    appendLog(`Камера подключена: ${videoEl.videoWidth}?${videoEl.videoHeight}`);
   } catch (e) {
     appendLog('Не удалось подключить камеру: ' + e.message);
   }
@@ -388,8 +388,8 @@ async function runPass(passNumber) {
 }
 
 // ==================== ОБЪЕДИНЕНИЕ ДВУХ ПРОХОДОВ В X,Y,Z ====================
-// Проход 1 (вид спереди): горизонталь кадра → X, вертикаль → Y.
-// Проход 2 (вид сбоку, после поворота на 90°): горизонталь кадра → Z, вертикаль → Y.
+// Проход 1 (вид спереди): горизонталь кадра > X, вертикаль > Y.
+// Проход 2 (вид сбоку, после поворота на 90°): горизонталь кадра > Z, вертикаль > Y.
 // Соответствие точек между проходами — по индексу светодиода, поэтому
 // сложная задача stereo correspondence здесь просто не возникает.
 function computePoints() {
@@ -527,8 +527,8 @@ function render() {
         <h2>Шаг 1 · Подключение</h2>
         <p class="hint">Нужны оба устройства, прежде чем начать сканирование.</p>
         <div class="row">
-          <button data-action="connectSerial" ${state.serialConnected ? 'disabled' : ''}>${state.serialConnected ? '✓ Arduino подключен' : 'Подключить Arduino'}</button>
-          <button data-action="connectCamera" ${state.cameraConnected ? 'disabled' : ''}>${state.cameraConnected ? '✓ Камера подключена' : 'Подключить камеру'}</button>
+          <button data-action="connectSerial" ${state.serialConnected ? 'disabled' : ''}>${state.serialConnected ? '? Arduino подключен' : 'Подключить Arduino'}</button>
+          <button data-action="connectCamera" ${state.cameraConnected ? 'disabled' : ''}>${state.cameraConnected ? '? Камера подключена' : 'Подключить камеру'}</button>
         </div>
         <button data-action="toPass1Ready" class="primary" ${(state.serialConnected && state.cameraConnected) ? '' : 'disabled'}>Далее</button>
       `;
